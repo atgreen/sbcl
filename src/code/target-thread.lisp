@@ -969,6 +969,10 @@ Notes:
   (or (%try-mutex mutex)
       #+sb-thread
       (when waitp
+        (when (and *current-fiber* *current-scheduler*)
+          (let ((result (funcall '%fiber-grab-mutex mutex timeout)))
+            (unless (eq result :pinned-fall-through)
+              (return-from grab-mutex result))))
         (multiple-value-call #'deadlock-aware-mutex-wait mutex timeout (decode-timeout timeout)))))
 
 (declaim (ftype (sfunction (mutex) boolean) grab-mutex-no-check-deadlock))
@@ -977,6 +981,10 @@ Notes:
   ;; Always wait with infinite timeout, never examine the waiting-for graph.
   ;; This _does_ support *DEADLINE* hence the DECODE-TIMEOUT call.
   (or (%try-mutex mutex)
+      (when (and *current-fiber* *current-scheduler*)
+        (let ((result (funcall '%fiber-grab-mutex mutex nil)))
+          (unless (eq result :pinned-fall-through)
+            (return-from grab-mutex-no-check-deadlock result))))
       (multiple-value-call #'mutex-wait mutex nil (decode-timeout nil))))
 
 (declaim (ftype (sfunction (mutex &key (:if-not-owner (member :punt :warn :error :force))) null)
@@ -1090,6 +1098,15 @@ IF-NOT-OWNER is :FORCE)."
   (declare (ignore queue mutex check-deadlock to-sec to-usec stop-sec stop-usec deadlinep))
   #-sb-thread
   (sb-ext:wait-for nil :timeout timeout) ; Yeah...
+  ;; Fiber dispatch (before any interrupt/futex setup).
+  ;; %fiber-condition-wait handles pin check internally; returns
+  ;; :pinned-fall-through when the fiber is pinned and should block normally.
+  #+sb-thread
+  (when (and *current-fiber* *current-scheduler*)
+    (let ((vals (multiple-value-list
+                 (funcall '%fiber-condition-wait queue mutex timeout stop-sec stop-usec))))
+      (unless (eq (first vals) :pinned-fall-through)
+        (return-from %condition-wait (values-list vals)))))
   #+sb-thread
   (let ((me *current-thread*))
     (declare (ignorable me)) ; not used if #+sb-futex
@@ -1263,6 +1280,9 @@ IMPORTANT: The same mutex that is used in the corresponding CONDITION-WAIT
 must be held by this thread during this call."
   (declare (ignorable queue n))
   #-sb-thread (error "Not supported in unithread builds.")
+  ;; Wake fiber waiters via generation counter (caller holds mutex, no race)
+  #+sb-thread
+  (incf (waitqueue-fiber-generation queue))
   #+sb-futex
   (progn
       ;; No problem if >1 thread notifies during the comment in condition-wait:

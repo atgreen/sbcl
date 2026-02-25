@@ -716,6 +716,62 @@ or NIL on timeout."
       nil))
 
 
+;;;; ===== Fiber-aware threading primitives =====
+
+(defun %fiber-condition-wait (queue mutex timeout stop-sec stop-usec)
+  "Fiber-aware condition-wait. Release MUTEX, park fiber until notified,
+re-acquire MUTEX. Returns T (or multiple values with remaining time)
+on success, NIL on timeout. Returns :PINNED-FALL-THROUGH when fiber
+is pinned (caller should use the OS blocking path)."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'condition-wait)
+    (return-from %fiber-condition-wait :pinned-fall-through))
+  (let ((gen (waitqueue-fiber-generation queue)))
+    (release-mutex mutex)
+    (let ((notified (fiber-park
+                     (lambda () (/= (waitqueue-fiber-generation queue) gen))
+                     :timeout timeout)))
+      (if (not notified)
+          nil  ; timeout during wait
+          ;; Notified — re-acquire mutex with remaining time
+          (let ((remaining-secs
+                  (when stop-sec
+                    (multiple-value-bind (sec usec)
+                        (sb-impl::relative-decoded-times stop-sec stop-usec)
+                      (when (and (zerop sec) (not (plusp usec)))
+                        (return-from %fiber-condition-wait nil))
+                      (+ sec (/ usec 1000000.0d0))))))
+            (unless (or (%try-mutex mutex)
+                        (%fiber-grab-mutex-internal mutex remaining-secs))
+              (return-from %fiber-condition-wait nil))
+            ;; Success: return T, or (values T remaining-sec remaining-usec)
+            (if stop-sec
+                (multiple-value-bind (sec usec)
+                    (sb-impl::relative-decoded-times stop-sec stop-usec)
+                  (values t sec usec))
+                t))))))
+
+(defun %fiber-grab-mutex-internal (mutex timeout)
+  "Internal fiber-aware mutex acquisition (no pin check).
+Returns T on success, NIL on timeout."
+  (loop
+    (let ((ok (fiber-park
+               (lambda ()
+                 #+sb-futex (eql (mutex-state mutex) 0)
+                 #-sb-futex (eql (mutex-%owner mutex) 0))
+               :timeout timeout)))
+      (unless ok (return nil))           ; timeout
+      (when (%try-mutex mutex) (return t)))))
+
+(defun %fiber-grab-mutex (mutex timeout)
+  "Fiber-aware mutex acquisition. Yield until mutex is free, then CAS.
+Returns T on success, NIL on timeout. Returns :PINNED-FALL-THROUGH
+when fiber is pinned (caller should use the OS blocking path)."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'grab-mutex)
+    (return-from %fiber-grab-mutex :pinned-fall-through))
+  (%fiber-grab-mutex-internal mutex timeout))
+
 ;;;; ===== Exports =====
 
 (export '(make-fiber
