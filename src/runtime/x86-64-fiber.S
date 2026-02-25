@@ -11,7 +11,7 @@
  * files for more information.
  */
 
-#ifdef __linux__
+#ifdef __ELF__
 /* Mark stack as non-executable for GNU ld */
 .section .note.GNU-stack,"",@progbits
 #endif
@@ -25,7 +25,7 @@
  * *old_rsp_slot, loads RSP from *new_rsp_slot, pops registers, and returns.
  */
 
-#ifdef LISP_FEATURE_WIN32
+#ifdef _WIN32
 /*
  * Windows x64 ABI:
  *   Arguments: rcx, rdx (not rdi, rsi)
@@ -143,4 +143,4 @@ fiber_entry_trampoline:
         hlt                         /* unreachable */
 .size fiber_entry_trampoline, .-fiber_entry_trampoline
 
-#endif /* LISP_FEATURE_WIN32 */
+#endif /* _WIN32 */

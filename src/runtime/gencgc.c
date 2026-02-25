@@ -3270,7 +3270,7 @@ conservative_stack_scan(struct thread* th,
      * also scan the carrier's suspended stack (skipping guard pages). */
     lispobj* scan_end = th->control_stack_end;
     if (gc_active_fiber_stack_end
-        && !(esp >= th->control_stack_start && esp < th->control_stack_end)) {
+        && !((lispobj*)esp >= th->control_stack_start && (lispobj*)esp < th->control_stack_end)) {
         scan_end = gc_active_fiber_stack_end;
         /* Also scan the carrier's suspended control stack.
          * Skip the 3 guard pages at the bottom (hard, soft, return). */

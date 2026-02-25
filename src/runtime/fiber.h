@@ -81,9 +81,11 @@ void free_fiber_gc_info(struct fiber_gc_info* info);
 void scan_fiber_stacks(void);
 void scavenge_fiber_binding_stacks(int compacting_p, void (*mark_fun)(lispobj));
 
-/* Assembly routines */
+/* Assembly routines (x86-64 only for now) */
+#ifdef LISP_FEATURE_X86_64
 extern void fiber_switch(uint64_t* old_rsp_slot, uint64_t* new_rsp_slot);
 extern void fiber_entry_trampoline(void);
+#endif
 
 /* C trampoline called from assembly */
 void fiber_run_and_finish(lispobj fiber_lispobj);
