@@ -331,7 +331,7 @@ FUNCTION should be a function of no arguments."
 ;;; fiber is resumed.
 ;;;
 ;;; Instead, we directly swap TLS values:
-;;;   On yield:  save fiber's current TLS → overlay, restore carrier's
+;;;   On yield:  save fiber's current TLS -> overlay, restore carrier's
 ;;;              values from the outermost binding stack entry's old_value
 ;;;   On resume: write fiber's saved values from overlay back to TLS
 ;;;
@@ -748,7 +748,7 @@ is pinned (caller should use the OS blocking path)."
                      :timeout timeout)))
       (if (not notified)
           nil  ; timeout during wait
-          ;; Notified — re-acquire mutex with remaining time
+          ;; Notified -- re-acquire mutex with remaining time
           (let ((remaining-secs
                   (when stop-sec
                     (multiple-value-bind (sec usec)
