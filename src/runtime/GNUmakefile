@@ -71,7 +71,7 @@ endif
 endif
 
 COMMON_SRC = alloc.c arena.c backtrace.c breakpoint.c coalesce.c	\
-	coreparse.c dynbind.c funcall.c gc-common.c globals.c		\
+	coreparse.c dynbind.c fiber.c funcall.c gc-common.c globals.c	\
 	hopscotch.c interr.c interrupt.c largefile.c main.c		\
 	math.c monitor.c murmur_hash.c os-common.c parse.c              \
 	perfecthash.c print.c time.c                                    \
