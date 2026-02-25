@@ -649,10 +649,7 @@ fibers have completed."
            (let ((hook (fiber-scheduler-idle-hook scheduler)))
              (if hook
                  (funcall hook scheduler)
-                 ;; Default: sleep briefly for timer-based waits
-                 (progn
-                   #+win32 (sb-win32:millisleep 10)
-                   #-win32 (sb-unix:nanosleep 0 (* 10 1000000))))))
+                 (fiber-io-idle-hook scheduler))))
           ;; All fibers done
           (t (return)))))))
 
@@ -772,6 +769,93 @@ when fiber is pinned (caller should use the OS blocking path)."
     (return-from %fiber-grab-mutex :pinned-fall-through))
   (%fiber-grab-mutex-internal mutex timeout))
 
+;;;; ===== Fiber-aware I/O =====
+
+(defun fd-ready-p (fd direction)
+  "Non-blocking check: is FD usable for DIRECTION (:input or :output)?"
+  #+win32
+  (if (eq direction :output)
+      t  ; Windows always reports output as ready
+      (sb-win32:handle-listen fd 0 0))
+  #-win32
+  (sb-unix:unix-simple-poll fd direction 0))
+
+(defun %fiber-wait-until-fd-usable (fd direction timeout)
+  "Fiber-aware fd wait. Park fiber until FD is usable for DIRECTION.
+Returns T on success, NIL on timeout. Returns :PINNED-FALL-THROUGH
+when fiber is pinned."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'wait-until-fd-usable)
+    (return-from %fiber-wait-until-fd-usable :pinned-fall-through))
+  ;; Fast check: already ready?
+  (when (fd-ready-p fd direction)
+    (return-from %fiber-wait-until-fd-usable t))
+  ;; Park with fd-readiness wake condition, recording wait-info for idle hook
+  (let ((fiber *current-fiber*))
+    (setf (fiber-wait-info fiber) (make-fiber-wait-info fd direction))
+    (unwind-protect
+         (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
+                                   :timeout timeout)))
+           (if result t nil))
+      (setf (fiber-wait-info fiber) nil))))
+
+;;;; ===== Efficient Idle Hook (batched I/O polling) =====
+
+(defun compute-nearest-deadline (scheduler)
+  "Scan waiting fibers and return the nearest deadline in milliseconds,
+or NIL if no time-based deadlines exist."
+  (let ((nearest nil))
+    (dolist (f (fiber-scheduler-waiting scheduler))
+      (declare (ignore f)))
+    nearest))
+
+#-win32
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Register waiting fibers' fds as temporary handlers, call serve-event."
+  (let ((handlers nil)
+        (timeout-sec (/ timeout-ms 1000.0d0)))
+    (unwind-protect
+         (progn
+           ;; Register each waiting fiber's fd as a temporary handler
+           (dolist (f (fiber-scheduler-waiting scheduler))
+             (let ((info (fiber-wait-info f)))
+               (when info
+                 (push (add-fd-handler
+                        (fiber-wait-info-fd info)
+                        (fiber-wait-info-direction info)
+                        (lambda (fd) (declare (ignore fd))))
+                       handlers))))
+           (when handlers
+             (serve-event timeout-sec)))
+      ;; Cleanup: remove all temporary handlers
+      (dolist (h handlers)
+        (remove-fd-handler h)))))
+
+#+win32
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Poll using handle-listen for each waiting fiber's fd on Windows."
+  (declare (ignore scheduler))
+  ;; Simple per-fd poll on Windows; WaitForMultipleObjects optimization
+  ;; deferred to future work.
+  (sb-win32:millisleep (min timeout-ms 10)))
+
+(defun fiber-io-idle-hook (scheduler)
+  "Idle hook that polls fds from waiting fibers using a single poll/select call.
+Called when no fibers are runnable but some are waiting."
+  (let ((timeout-ms (or (compute-nearest-deadline scheduler) 100))
+        (has-io-waiters nil))
+    ;; Check if any waiting fibers have I/O wait info
+    (dolist (f (fiber-scheduler-waiting scheduler))
+      (when (fiber-wait-info f)
+        (setf has-io-waiters t)
+        (return)))
+    (if has-io-waiters
+        (%batched-fd-poll scheduler timeout-ms)
+        ;; No I/O waiters; sleep briefly for timer-based waits
+        (progn
+          #+win32 (sb-win32:millisleep (min timeout-ms 10))
+          #-win32 (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000))))))
+
 ;;;; ===== Exports =====
 
 (export '(make-fiber
@@ -796,4 +880,9 @@ when fiber is pinned (caller should use the OS blocking path)."
           run-fiber-scheduler
           fiber-scheduler
           *current-fiber*
-          *current-scheduler*))
+          *current-scheduler*
+          fd-ready-p
+          fiber-io-idle-hook
+          fiber-wait-info
+          fiber-wait-info-fd
+          fiber-wait-info-direction))

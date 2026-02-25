@@ -3474,7 +3474,15 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "MAKE-FIBER-SCHEDULER"
            "RUN-FIBER-SCHEDULER"
            "SUBMIT-FIBER"
-           "WITH-FIBER-PINNED"))
+           "WITH-FIBER-PINNED"
+           "FD-READY-P"
+           "FIBER-IO-IDLE-HOOK"
+           "FIBER-WAIT-INFO"
+           "FIBER-WAIT-INFO-FD"
+           "FIBER-WAIT-INFO-DIRECTION"
+           "*PINNED-BLOCKING-ACTION*"
+           "FIBER-JOIN"
+           "FIBER-PARK"))
 
 (defpackage "SB-WALKER"
   (:documentation "internal: a code walker used by PCL")
