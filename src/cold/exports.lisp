@@ -3452,7 +3452,29 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "CLEAR-SEMAPHORE-NOTIFICATION"
            "MAKE-SEMAPHORE-NOTIFICATION"
            "SEMAPHORE-NOTIFICATION"
-           "SEMAPHORE-NOTIFICATION-STATUS"))
+           "SEMAPHORE-NOTIFICATION-STATUS"
+           ;; Fibers (virtual threads)
+
+           "*CURRENT-FIBER*"
+           "*CURRENT-SCHEDULER*"
+           "CURRENT-FIBER"
+           "DESTROY-FIBER"
+           "FIBER"
+           "FIBER-ALIVE-P"
+           "FIBER-CAN-YIELD-P"
+           "FIBER-NAME"
+           "FIBER-PIN"
+           "FIBER-RESULT"
+           "FIBER-SCHEDULER"
+           "FIBER-SLEEP"
+           "FIBER-STATE"
+           "FIBER-UNPIN"
+           "FIBER-YIELD"
+           "MAKE-FIBER"
+           "MAKE-FIBER-SCHEDULER"
+           "RUN-FIBER-SCHEDULER"
+           "SUBMIT-FIBER"
+           "WITH-FIBER-PINNED"))
 
 (defpackage "SB-WALKER"
   (:documentation "internal: a code walker used by PCL")

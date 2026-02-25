@@ -212,3 +212,8 @@ temporarily.")
 (progn
   (defvar *current-thread*)
   (declaim (type thread *current-thread*)))
+
+;; Fiber context variables (declared early so serve-event.lisp can check them;
+;; fiber.lisp provides the actual implementation)
+(defvar *current-fiber* nil)
+(defvar *current-scheduler* nil)
