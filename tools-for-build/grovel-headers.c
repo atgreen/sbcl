@@ -59,6 +59,11 @@
 #ifdef LISP_FEATURE_BSD
   #include <sys/param.h>
   #include <sys/sysctl.h>
+  #include <sys/event.h>
+#endif
+
+#ifdef LISP_FEATURE_LINUX
+  #include <sys/epoll.h>
 #endif
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -187,6 +192,24 @@ main(int argc, char __attribute__((unused)) *argv[])
     defconstant("pollhup", POLLHUP);
     defconstant("pollnval", POLLNVAL);
     defconstant("pollerr", POLLERR);
+
+#ifdef LISP_FEATURE_LINUX
+    printf(";;; epoll()\n");
+    defconstant("epollin", EPOLLIN);
+    defconstant("epollout", EPOLLOUT);
+    defconstant("epollerr", EPOLLERR);
+    defconstant("epollhup", EPOLLHUP);
+#endif
+
+#ifdef LISP_FEATURE_BSD
+    printf(";;; kqueue()\n");
+    DEFCONSTANT("evfilt-read", EVFILT_READ);
+    DEFCONSTANT("evfilt-write", EVFILT_WRITE);
+    defconstant("ev-add", EV_ADD);
+    defconstant("ev-delete", EV_DELETE);
+    defconstant("ev-enable", EV_ENABLE);
+#endif
+
     DEFTYPE("nfds-t", nfds_t);
     printf(";;; types, types, types\n");
     DEFTYPE("clock-t", clock_t);

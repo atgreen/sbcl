@@ -118,6 +118,10 @@
   (carrier-unwind-protect-block 0 :type sb-vm:word)
   ;; Hook called when no fibers are runnable but some are waiting
   (idle-hook nil :type (or null function))
+  ;; Event multiplexer fd: epoll (Linux), kqueue (BSD), -1 = unavailable
+  (event-fd -1 :type fixnum)
+  ;; Hash table of fd -> registered-events-mask (for epoll ctl tracking)
+  (registered-fds nil :type (or null hash-table)))
 
 ;;;; ===== Per-thread scheduler =====
 ;;;
@@ -590,9 +594,17 @@ back to the scheduler."
 
 (defun make-fiber-scheduler (&key idle-hook)
   "Create a new fiber scheduler for the current thread."
-  (%make-fiber-scheduler
-   :carrier *current-thread*
-   :idle-hook idle-hook))
+  (let ((sched (%make-fiber-scheduler
+                :carrier *current-thread*
+                :idle-hook idle-hook)))
+    ;; Try to create platform-optimal event multiplexer
+    #+(or linux bsd)
+    (let ((efd #+linux (sb-unix:epoll-create1 0)
+               #+bsd   (sb-unix:kqueue)))
+      (when efd  ; nil on error
+        (setf (fiber-scheduler-event-fd sched) efd
+              (fiber-scheduler-registered-fds sched) (make-hash-table))))
+    sched))
 
 (defun submit-fiber (scheduler fiber)
   "Submit a fiber to a scheduler for execution."
@@ -608,50 +620,57 @@ fibers have completed."
   (install-fiber-trampoline)
   (let ((*current-scheduler* scheduler)
         (*current-fiber* nil))
-    (loop
-      ;; Check waiting fibers for wake conditions
-      (let ((still-waiting nil))
-        (dolist (f (fiber-scheduler-waiting scheduler))
-          (if (and (fiber-wake-condition f)
-                   (funcall (fiber-wake-condition f)))
-              (progn
-                (setf (fiber-state f) :runnable
-                      (fiber-wake-condition f) nil)
-                (setf (fiber-scheduler-run-queue scheduler)
-                      (nconc (fiber-scheduler-run-queue scheduler) (list f))))
-              (push f still-waiting)))
-        (setf (fiber-scheduler-waiting scheduler) (nreverse still-waiting)))
-      ;; Pick next fiber
-      (let ((fiber (pop (fiber-scheduler-run-queue scheduler))))
-        (cond
-          (fiber
-           (setf (fiber-scheduler-current-fiber scheduler) fiber)
-           (ecase (fiber-state fiber)
-             (:created  (start-fiber scheduler fiber))
-             (:runnable (resume-fiber scheduler fiber)))
-           ;; Fiber yielded or finished
-           (setf (fiber-scheduler-current-fiber scheduler) nil)
-           ;; Handle post-switch state
-           (case (fiber-state fiber)
-             (:suspended
-              ;; Move to waiting list if has wake condition, else back to run queue
-              (if (fiber-wake-condition fiber)
-                  (push fiber (fiber-scheduler-waiting scheduler))
-                  (progn
-                    (setf (fiber-state fiber) :runnable)
-                    (setf (fiber-scheduler-run-queue scheduler)
-                          (nconc (fiber-scheduler-run-queue scheduler) (list fiber))))))
-             (:dead
-              ;; Clean up dead fiber resources
-              (destroy-fiber fiber))))
-          ;; No runnable fibers but some waiting
-          ((fiber-scheduler-waiting scheduler)
-           (let ((hook (fiber-scheduler-idle-hook scheduler)))
-             (if hook
-                 (funcall hook scheduler)
-                 (fiber-io-idle-hook scheduler))))
-          ;; All fibers done
-          (t (return)))))))
+    (unwind-protect
+         (loop
+           ;; Check waiting fibers for wake conditions
+           (let ((still-waiting nil))
+             (dolist (f (fiber-scheduler-waiting scheduler))
+               (if (and (fiber-wake-condition f)
+                        (funcall (fiber-wake-condition f)))
+                   (progn
+                     (setf (fiber-state f) :runnable
+                           (fiber-wake-condition f) nil)
+                     (setf (fiber-scheduler-run-queue scheduler)
+                           (nconc (fiber-scheduler-run-queue scheduler) (list f))))
+                   (push f still-waiting)))
+             (setf (fiber-scheduler-waiting scheduler) (nreverse still-waiting)))
+           ;; Pick next fiber
+           (let ((fiber (pop (fiber-scheduler-run-queue scheduler))))
+             (cond
+               (fiber
+                (setf (fiber-scheduler-current-fiber scheduler) fiber)
+                (ecase (fiber-state fiber)
+                  (:created  (start-fiber scheduler fiber))
+                  (:runnable (resume-fiber scheduler fiber)))
+                ;; Fiber yielded or finished
+                (setf (fiber-scheduler-current-fiber scheduler) nil)
+                ;; Handle post-switch state
+                (case (fiber-state fiber)
+                  (:suspended
+                   ;; Move to waiting list if has wake condition, else back to run queue
+                   (if (fiber-wake-condition fiber)
+                       (push fiber (fiber-scheduler-waiting scheduler))
+                       (progn
+                         (setf (fiber-state fiber) :runnable)
+                         (setf (fiber-scheduler-run-queue scheduler)
+                               (nconc (fiber-scheduler-run-queue scheduler) (list fiber))))))
+                  (:dead
+                   ;; Clean up dead fiber resources
+                   (destroy-fiber fiber))))
+               ;; No runnable fibers but some waiting
+               ((fiber-scheduler-waiting scheduler)
+                (let ((hook (fiber-scheduler-idle-hook scheduler)))
+                  (if hook
+                      (funcall hook scheduler)
+                      (fiber-io-idle-hook scheduler))))
+               ;; All fibers done
+               (t (return)))))
+      ;; Cleanup: close event multiplexer fd
+      #+(or linux bsd)
+      (let ((efd (fiber-scheduler-event-fd scheduler)))
+        (when (plusp efd)
+          (sb-unix:unix-close efd)
+          (setf (fiber-scheduler-event-fd scheduler) -1))))))
 
 ;;;; ===== Convenience API =====
 
@@ -711,7 +730,6 @@ or NIL on timeout."
   (if (eq (fiber-state target) :dead)
       (fiber-result target)
       nil))
-
 
 ;;;; ===== Fiber-aware threading primitives =====
 
@@ -791,13 +809,82 @@ when fiber is pinned."
   (when (fd-ready-p fd direction)
     (return-from %fiber-wait-until-fd-usable t))
   ;; Park with fd-readiness wake condition, recording wait-info for idle hook
-  (let ((fiber *current-fiber*))
+  (let ((fiber *current-fiber*)
+        (scheduler *current-scheduler*))
     (setf (fiber-wait-info fiber) (make-fiber-wait-info fd direction))
+    (%event-register scheduler fd direction)
     (unwind-protect
          (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
                                    :timeout timeout)))
            (if result t nil))
+      (%event-deregister scheduler fd direction)
       (setf (fiber-wait-info fiber) nil))))
+
+;;;; ===== Event multiplexer registration (epoll/kqueue) =====
+
+#+(or linux bsd)
+(defun %event-register (scheduler fd direction)
+  "Register fd/direction with the scheduler's event multiplexer."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (when (minusp efd) (return-from %event-register))
+    #+linux
+    (let* ((table (fiber-scheduler-registered-fds scheduler))
+           (new-events (if (eq direction :input)
+                           sb-unix:epollin sb-unix:epollout))
+           (current (gethash fd table 0))
+           (combined (logior current new-events)))
+      (if (zerop current)
+          (sb-unix:epoll-ctl-add efd fd combined)
+          (sb-unix:epoll-ctl-mod efd fd combined))
+      (setf (gethash fd table) combined))
+    #+bsd
+    (%kqueue-register efd fd direction :add)))
+
+#+(or linux bsd)
+(defun %event-deregister (scheduler fd direction)
+  "Deregister fd/direction from the scheduler's event multiplexer."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (when (minusp efd) (return-from %event-deregister))
+    #+linux
+    (let* ((table (fiber-scheduler-registered-fds scheduler))
+           (remove-events (if (eq direction :input)
+                              sb-unix:epollin sb-unix:epollout))
+           (current (gethash fd table 0))
+           (remaining (logandc2 current remove-events)))
+      (if (zerop remaining)
+          (progn (sb-unix:epoll-ctl-del efd fd)
+                 (remhash fd table))
+          (progn (sb-unix:epoll-ctl-mod efd fd remaining)
+                 (setf (gethash fd table) remaining))))
+    #+bsd
+    (%kqueue-register efd fd direction :delete)))
+
+#-(or linux bsd)
+(defun %event-register (scheduler fd direction)
+  (declare (ignore scheduler fd direction)))
+#-(or linux bsd)
+(defun %event-deregister (scheduler fd direction)
+  (declare (ignore scheduler fd direction)))
+
+#+bsd
+(defun %kqueue-register (kq fd direction action)
+  "Add or delete a kevent filter for fd."
+  (let ((filter (if (eq direction :input)
+                    sb-unix:evfilt-read
+                    sb-unix:evfilt-write))
+        (flags (if (eq action :add)
+                   (logior sb-unix:ev-add sb-unix:ev-enable)
+                   sb-unix:ev-delete)))
+    (with-alien ((kev (struct sb-unix:kevent)))
+      (setf (slot kev 'sb-unix::ident) fd
+            (slot kev 'sb-unix::filter) filter
+            (slot kev 'sb-unix::flags) flags
+            (slot kev 'sb-unix::fflags) 0
+            (slot kev 'sb-unix::data) 0
+            (slot kev 'sb-unix::udata) 0)
+      ;; Register change, don't wait for events (nevents=0)
+      (sb-unix:kevent kq (alien-sap (addr kev)) 1
+                      (int-sap 0) 0 (int-sap 0)))))
 
 ;;;; ===== Efficient Idle Hook (batched I/O polling) =====
 
@@ -809,14 +896,14 @@ or NIL if no time-based deadlines exist."
       (declare (ignore f)))
     nearest))
 
+;;; Shared fallback: register temporary handlers and call serve-event.
 #-win32
-(defun %batched-fd-poll (scheduler timeout-ms)
-  "Register waiting fibers' fds as temporary handlers, call serve-event."
+(defun %batched-fd-poll/serve-event (scheduler timeout-ms)
+  "Fallback: register temporary handlers and call serve-event."
   (let ((handlers nil)
         (timeout-sec (/ timeout-ms 1000.0d0)))
     (unwind-protect
          (progn
-           ;; Register each waiting fiber's fd as a temporary handler
            (dolist (f (fiber-scheduler-waiting scheduler))
              (let ((info (fiber-wait-info f)))
                (when info
@@ -827,17 +914,53 @@ or NIL if no time-based deadlines exist."
                        handlers))))
            (when handlers
              (serve-event timeout-sec)))
-      ;; Cleanup: remove all temporary handlers
       (dolist (h handlers)
         (remove-fd-handler h)))))
 
+;;; Platform-specific %batched-fd-poll implementations
+#+linux
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Wait for I/O events using epoll, falling back to serve-event."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (if (minusp efd)
+        (%batched-fd-poll/serve-event scheduler timeout-ms)
+        (let ((buf (make-array 64 :element-type '(signed-byte 32))))
+          (sb-sys:with-pinned-objects (buf)
+            (let ((sap (sb-sys:vector-sap buf)))
+              (sb-unix:epoll-wait efd sap 64
+                                  (min timeout-ms 1000))))))))
+
+#+bsd
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Wait for I/O events using kqueue, falling back to serve-event."
+  (let ((kq (fiber-scheduler-event-fd scheduler)))
+    (if (minusp kq)
+        (%batched-fd-poll/serve-event scheduler timeout-ms)
+        (with-alien ((timeout (struct sb-unix::timespec)))
+          (let ((sec (truncate timeout-ms 1000))
+                (nsec (* (mod timeout-ms 1000) 1000000)))
+            (setf (slot timeout 'sb-unix::tv-sec) sec
+                  (slot timeout 'sb-unix::tv-nsec) nsec)
+            (with-alien ((events (array (struct sb-unix:kevent) 64)))
+              (sb-unix:kevent kq (int-sap 0) 0
+                              (alien-sap (addr events)) 64
+                              (alien-sap (addr timeout)))))))))
+
+#-(or linux bsd win32)
+(defun %batched-fd-poll (scheduler timeout-ms)
+  (%batched-fd-poll/serve-event scheduler timeout-ms))
+
 #+win32
 (defun %batched-fd-poll (scheduler timeout-ms)
-  "Poll using handle-listen for each waiting fiber's fd on Windows."
-  (declare (ignore scheduler))
-  ;; Simple per-fd poll on Windows; WaitForMultipleObjects optimization
-  ;; deferred to future work.
-  (sb-win32:millisleep (min timeout-ms 10)))
+  "Poll each waiting fiber's fd on Windows."
+  (let ((any-ready nil))
+    (dolist (f (fiber-scheduler-waiting scheduler))
+      (let ((info (fiber-wait-info f)))
+        (when (and info (fd-ready-p (fiber-wait-info-fd info)
+                                     (fiber-wait-info-direction info)))
+          (setf any-ready t))))
+    (unless any-ready
+      (sb-win32:millisleep (min timeout-ms 10)))))
 
 (defun fiber-io-idle-hook (scheduler)
   "Idle hook that polls fds from waiting fibers using a single poll/select call.

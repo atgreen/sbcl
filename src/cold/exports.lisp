@@ -1334,6 +1334,14 @@ interface stability.")
    "POLLFD" "POLLIN" "POLLOUT" "POLLHUP" "POLLNVAL" "POLLERR"
    "FD" "EVENTS" "REVENTS"
    "FD-ISSET" "FD-SET" "UNIX-FAST-SELECT"
+
+   ;; epoll (Linux)
+   "EPOLL-CREATE1" "EPOLL-CTL-ADD" "EPOLL-CTL-MOD" "EPOLL-CTL-DEL"
+   "EPOLL-WAIT" "EPOLLIN" "EPOLLOUT" "EPOLLERR" "EPOLLHUP"
+
+   ;; kqueue (BSD)
+   "KQUEUE" "KEVENT" "EVFILT-READ" "EVFILT-WRITE"
+   "EV-ADD" "EV-DELETE" "EV-ENABLE"
    "PTHREAD-KILL" "RAISE" "UNIX-KILL" "UNIX-KILLPG"
    "FD-ZERO" "FD-CLR"
    "FD-SETSIZE"))
@@ -3470,19 +3478,16 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "FIBER-STATE"
            "FIBER-UNPIN"
            "FIBER-YIELD"
-           "MAKE-FIBER"
-           "MAKE-FIBER-SCHEDULER"
-           "RUN-FIBER-SCHEDULER"
-           "SUBMIT-FIBER"
-           "WITH-FIBER-PINNED"
            "FD-READY-P"
            "FIBER-IO-IDLE-HOOK"
            "FIBER-WAIT-INFO"
            "FIBER-WAIT-INFO-FD"
            "FIBER-WAIT-INFO-DIRECTION"
-           "*PINNED-BLOCKING-ACTION*"
-           "FIBER-JOIN"
-           "FIBER-PARK"))
+           "MAKE-FIBER"
+           "MAKE-FIBER-SCHEDULER"
+           "RUN-FIBER-SCHEDULER"
+           "SUBMIT-FIBER"
+           "WITH-FIBER-PINNED"))
 
 (defpackage "SB-WALKER"
   (:documentation "internal: a code walker used by PCL")

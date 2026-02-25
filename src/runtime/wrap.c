@@ -616,3 +616,41 @@ double sb_hypotf (double x, double y) {
 #endif
 
 int sb_fileno(FILE* f) { return fileno(f); } // might be a C macro
+
+#ifdef LISP_FEATURE_LINUX
+#include <sys/epoll.h>
+
+int sb_epoll_create1(int flags) {
+    return epoll_create1(flags);
+}
+
+int sb_epoll_ctl_add(int epfd, int fd, unsigned int events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+int sb_epoll_ctl_mod(int epfd, int fd, unsigned int events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+int sb_epoll_ctl_del(int epfd, int fd) {
+    return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+/* Wait for events. Returns count of ready fds written to fds_out,
+   or -1 on error. fds_out must hold at least maxevents ints. */
+int sb_epoll_wait(int epfd, int *fds_out, int maxevents, int timeout) {
+    struct epoll_event events[256];
+    int n_events = maxevents > 256 ? 256 : maxevents;
+    int n = epoll_wait(epfd, events, n_events, timeout);
+    for (int i = 0; i < n; i++) {
+        fds_out[i] = events[i].data.fd;
+    }
+    return n;
+}
+#endif
