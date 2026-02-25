@@ -960,7 +960,7 @@ or NIL if no time-based deadlines exist."
                                      (fiber-wait-info-direction info)))
           (setf any-ready t))))
     (unless any-ready
-      (sb-win32:millisleep (min timeout-ms 10)))))
+      (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000)))))
 
 (defun fiber-io-idle-hook (scheduler)
   "Idle hook that polls fds from waiting fibers using a single poll/select call.
@@ -975,9 +975,7 @@ Called when no fibers are runnable but some are waiting."
     (if has-io-waiters
         (%batched-fd-poll scheduler timeout-ms)
         ;; No I/O waiters; sleep briefly for timer-based waits
-        (progn
-          #+win32 (sb-win32:millisleep (min timeout-ms 10))
-          #-win32 (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000))))))
+        (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000)))))
 
 ;;;; ===== Exports =====
 
