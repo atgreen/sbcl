@@ -207,56 +207,142 @@ fiber_switch 'returns' into fiber_entry_trampoline."
          (stack-top (+ stack-start stack-size))
          (trampoline-addr (fiber-entry-trampoline-address))
          (fiber-lispobj (sb-kernel:get-lisp-obj-address fiber)))
-    ;; Layout (offsets from stack_top, growing downward):
-    ;; SysV ABI (6 callee-saved: rbp, rbx, r12-r15):
-    ;;   stack_top - 0x08: [alignment padding: 0]
-    ;;   stack_top - 0x10: [spare slot: 0]
-    ;;   stack_top - 0x18: [fiber_entry_trampoline address] (return addr)
-    ;;   stack_top - 0x20: [fiber lispobj] -> popped into rbp
-    ;;   stack_top - 0x28: [0] -> popped into rbx
-    ;;   stack_top - 0x30: [0] -> popped into r12
-    ;;   stack_top - 0x38: [0] -> popped into r13
-    ;;   stack_top - 0x40: [0] -> popped into r14
-    ;;   stack_top - 0x48: [0] -> popped into r15
-    ;;                     ^--- initial RSP (72 bytes from top)
-    ;;
-    ;; Win64 ABI (8 callee-saved: rbp, rbx, rdi, rsi, r12-r15):
-    ;;   stack_top - 0x08: [alignment padding: 0]
-    ;;   stack_top - 0x10: [spare slot: 0]
-    ;;   stack_top - 0x18: [fiber_entry_trampoline address] (return addr)
-    ;;   stack_top - 0x20: [fiber lispobj] -> popped into rbp
-    ;;   stack_top - 0x28: [0] -> popped into rbx
-    ;;   stack_top - 0x30: [0] -> popped into rdi
-    ;;   stack_top - 0x38: [0] -> popped into rsi
-    ;;   stack_top - 0x40: [0] -> popped into r12
-    ;;   stack_top - 0x48: [0] -> popped into r13
-    ;;   stack_top - 0x50: [0] -> popped into r14
-    ;;   stack_top - 0x58: [0] -> popped into r15
-    ;;                     ^--- initial RSP (88 bytes from top)
     (let ((sap (sb-sys:int-sap stack-top)))
-      (setf (sb-sys:sap-ref-word sap -8) 0)   ; alignment padding
-      (setf (sb-sys:sap-ref-word sap -16) 0)  ; spare slot
-      (setf (sb-sys:sap-ref-word sap -24) trampoline-addr)  ; return addr
-      (setf (sb-sys:sap-ref-word sap -32) fiber-lispobj)    ; -> rbp
-      (setf (sb-sys:sap-ref-word sap -40) 0)  ; -> rbx
-      #+win32
+
+      #+arm64
+      ;; ARM64 (AAPCS64): 20 callee-saved regs, 160 bytes.
+      ;; fiber_switch saves: x29, x30, x19-x28, d8-d15.
+      ;; Initial frame has fiber_lispobj in x29 slot, trampoline in x30 slot.
+      ;;
+      ;; Stack layout (offsets from stack_top, growing downward):
+      ;;   -0x08: [alignment padding: 0]   (16-byte stack alignment)
+      ;;   -0xA8: x29 = fiber_lispobj      (frame base)
+      ;;   -0xA0: x30 = trampoline_addr
+      ;;   -0x98..-0x60: x19-x28 = 0
+      ;;   -0x58..-0x10: d8-d15 = 0
+      ;;                 ^--- initial SP = stack_top - 0xA8 (168 bytes)
       (progn
-        (setf (sb-sys:sap-ref-word sap -48) 0)  ; -> rdi
-        (setf (sb-sys:sap-ref-word sap -56) 0)  ; -> rsi
-        (setf (sb-sys:sap-ref-word sap -64) 0)  ; -> r12
-        (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r13
-        (setf (sb-sys:sap-ref-word sap -80) 0)  ; -> r14
-        (setf (sb-sys:sap-ref-word sap -88) 0)  ; -> r15
-        ;; Initial RSP = stack_top - 88 (8 regs * 8 + return addr + padding)
-        (setf (fiber-saved-rsp fiber) (- stack-top 88)))
-      #-win32
+        (setf (sb-sys:sap-ref-word sap -8) 0)    ; alignment padding
+        ;; 160-byte frame starts at stack_top - 8 - 160 = stack_top - 168
+        ;; But fiber_switch uses "stp x29,x30,[sp,#-160]!" so SP will be
+        ;; at frame_base.  We lay the frame at stack_top - 168:
+        ;;   frame_base = stack_top - 168
+        ;;   frame_base + 0   = x29  (fiber_lispobj)
+        ;;   frame_base + 8   = x30  (trampoline)
+        ;;   frame_base + 16  = x19  (0)
+        ;;   ...
+        ;;   frame_base + 144 = d14  (0)
+        ;;   frame_base + 152 = d15  (0)
+        ;; After frame: stack_top - 8 (alignment padding)
+        ;; Then the "ret" on restore will use x30 = trampoline.
+        (let ((base (- stack-top 168)))  ; 8 alignment + 160 frame
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)   0) fiber-lispobj)   ; x29
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)   8) trampoline-addr) ; x30
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  16) 0)  ; x19
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  24) 0)  ; x20
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  32) 0)  ; x21
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  40) 0)  ; x22
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  48) 0)  ; x23
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  56) 0)  ; x24
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  64) 0)  ; x25
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  72) 0)  ; x26
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  80) 0)  ; x27
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  88) 0)  ; x28
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base)  96) 0)  ; d8
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 104) 0)  ; d9
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 112) 0)  ; d10
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 120) 0)  ; d11
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 128) 0)  ; d12
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 136) 0)  ; d13
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 144) 0)  ; d14
+          (setf (sb-sys:sap-ref-word (sb-sys:int-sap base) 152) 0)  ; d15
+          (setf (fiber-saved-rsp fiber) base)))
+
+      #+arm
+      ;; ARM32 (AAPCS): 104-byte frame.
+      ;; fiber_switch saves: d8-d15 (64 bytes), then r3-r11,lr (40 bytes).
+      ;; On restore: vldmia d8-d15, ldmfd r3-r11,lr; bx lr.
+      ;; fiber_lispobj goes in r11 slot, trampoline in lr slot.
+      ;;
+      ;; Stack layout (offsets from frame base, sp points here):
+      ;;   +0x00..+0x3F: d8-d15 = 0 (8 doubles, 64 bytes)
+      ;;   +0x40: r3  = 0 (padding)
+      ;;   +0x44: r4  = 0
+      ;;   +0x48: r5  = 0
+      ;;   +0x4C: r6  = 0
+      ;;   +0x50: r7  = 0
+      ;;   +0x54: r8  = 0
+      ;;   +0x58: r9  = 0
+      ;;   +0x5C: r10 = 0
+      ;;   +0x60: r11 = fiber_lispobj
+      ;;   +0x64: lr  = trampoline_addr
+      ;;                ^--- frame top = base + 104
+      ;; Initial SP = stack_top - 104
+      (let ((base (- stack-top 104)))
+        ;; d8-d15: 8 doubles at offsets 0..56 (each 8 bytes)
+        (dotimes (i 8)
+          (setf (sb-sys:sap-ref-double (sb-sys:int-sap base) (* i 8)) 0.0d0))
+        ;; r3 (padding) through r10: offsets 64..92 (each 4 bytes)
+        (dotimes (i 8)  ; r3..r10
+          (setf (sb-sys:sap-ref-32 (sb-sys:int-sap base) (+ 64 (* i 4))) 0))
+        ;; r11 = fiber_lispobj at offset 96
+        (setf (sb-sys:sap-ref-32 (sb-sys:int-sap base) 96) fiber-lispobj)
+        ;; lr = trampoline at offset 100
+        (setf (sb-sys:sap-ref-32 (sb-sys:int-sap base) 100) trampoline-addr)
+        (setf (fiber-saved-rsp fiber) base))
+
+      #+(and x86-64 (not arm64) (not arm))
+      ;; x86-64 — original code for SysV and Win64
       (progn
-        (setf (sb-sys:sap-ref-word sap -48) 0)  ; -> r12
-        (setf (sb-sys:sap-ref-word sap -56) 0)  ; -> r13
-        (setf (sb-sys:sap-ref-word sap -64) 0)  ; -> r14
-        (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r15
-        ;; Initial RSP = stack_top - 72 (6 regs * 8 + return addr + padding)
-        (setf (fiber-saved-rsp fiber) (- stack-top 72))))))
+        ;; Layout (offsets from stack_top, growing downward):
+        ;; SysV ABI (6 callee-saved: rbp, rbx, r12-r15):
+        ;;   stack_top - 0x08: [alignment padding: 0]
+        ;;   stack_top - 0x10: [spare slot: 0]
+        ;;   stack_top - 0x18: [fiber_entry_trampoline address] (return addr)
+        ;;   stack_top - 0x20: [fiber lispobj] -> popped into rbp
+        ;;   stack_top - 0x28: [0] -> popped into rbx
+        ;;   stack_top - 0x30: [0] -> popped into r12
+        ;;   stack_top - 0x38: [0] -> popped into r13
+        ;;   stack_top - 0x40: [0] -> popped into r14
+        ;;   stack_top - 0x48: [0] -> popped into r15
+        ;;                     ^--- initial RSP (72 bytes from top)
+        ;;
+        ;; Win64 ABI (8 callee-saved: rbp, rbx, rdi, rsi, r12-r15):
+        ;;   stack_top - 0x08: [alignment padding: 0]
+        ;;   stack_top - 0x10: [spare slot: 0]
+        ;;   stack_top - 0x18: [fiber_entry_trampoline address] (return addr)
+        ;;   stack_top - 0x20: [fiber lispobj] -> popped into rbp
+        ;;   stack_top - 0x28: [0] -> popped into rbx
+        ;;   stack_top - 0x30: [0] -> popped into rdi
+        ;;   stack_top - 0x38: [0] -> popped into rsi
+        ;;   stack_top - 0x40: [0] -> popped into r12
+        ;;   stack_top - 0x48: [0] -> popped into r13
+        ;;   stack_top - 0x50: [0] -> popped into r14
+        ;;   stack_top - 0x58: [0] -> popped into r15
+        ;;                     ^--- initial RSP (88 bytes from top)
+        (setf (sb-sys:sap-ref-word sap -8) 0)   ; alignment padding
+        (setf (sb-sys:sap-ref-word sap -16) 0)  ; spare slot
+        (setf (sb-sys:sap-ref-word sap -24) trampoline-addr)  ; return addr
+        (setf (sb-sys:sap-ref-word sap -32) fiber-lispobj)    ; -> rbp
+        (setf (sb-sys:sap-ref-word sap -40) 0)  ; -> rbx
+        #+win32
+        (progn
+          (setf (sb-sys:sap-ref-word sap -48) 0)  ; -> rdi
+          (setf (sb-sys:sap-ref-word sap -56) 0)  ; -> rsi
+          (setf (sb-sys:sap-ref-word sap -64) 0)  ; -> r12
+          (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r13
+          (setf (sb-sys:sap-ref-word sap -80) 0)  ; -> r14
+          (setf (sb-sys:sap-ref-word sap -88) 0)  ; -> r15
+          ;; Initial RSP = stack_top - 88 (8 regs * 8 + return addr + padding)
+          (setf (fiber-saved-rsp fiber) (- stack-top 88)))
+        #-win32
+        (progn
+          (setf (sb-sys:sap-ref-word sap -48) 0)  ; -> r12
+          (setf (sb-sys:sap-ref-word sap -56) 0)  ; -> r13
+          (setf (sb-sys:sap-ref-word sap -64) 0)  ; -> r14
+          (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r15
+          ;; Initial RSP = stack_top - 72 (6 regs * 8 + return addr + padding)
+          (setf (fiber-saved-rsp fiber) (- stack-top 72)))))))
 
 ;;;; ===== Fiber creation =====
 

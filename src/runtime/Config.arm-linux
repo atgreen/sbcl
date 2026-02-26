@@ -11,7 +11,7 @@
 
 CFLAGS += -marm
 
-ASSEM_SRC = arm-assem.S
+ASSEM_SRC = arm-assem.S arm-fiber.S
 ARCH_SRC = arm-arch.c
 
 OS_SRC = linux-os.c linux-mman.c arm-linux-os.c

@@ -295,7 +295,7 @@ lispobj fiber_run_trampoline = 0;
 uword_t
 get_fiber_entry_trampoline_addr(void)
 {
-#ifdef LISP_FEATURE_X86_64
+#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_ARM)
     return (uword_t)fiber_entry_trampoline;
 #else
     return 0;  /* Fibers not yet supported on this architecture */
