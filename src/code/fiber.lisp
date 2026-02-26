@@ -60,12 +60,23 @@
 
 (defstruct (fiber-wait-info
             (:constructor make-fiber-wait-info (fd direction)))
+  "Describes why a fiber is waiting for I/O.  Holds the file descriptor
+and direction (:INPUT or :OUTPUT).  Used by the scheduler's idle hook to
+batch I/O polling across all waiting fibers."
   (fd -1 :type fixnum)
   (direction :input :type (member :input :output)))
 
 ;;;; ===== Fiber struct =====
 
 (defstruct (fiber (:constructor %make-fiber))
+  "A fiber is a lightweight cooperative thread that multiplexes onto a
+carrier OS thread.  Each fiber has its own control stack and binding
+stack allocated via mmap, and context switches between fibers use only
+callee-saved register save/restore (no kernel transition).
+
+Fiber states: :CREATED (made but not yet started), :RUNNABLE (ready to
+run), :RUNNING (currently executing), :SUSPENDED (yielded, waiting for a
+wake condition), :DEAD (finished or errored, resources freed)."
   (name nil :type (or null simple-string))
   (state :created :type (member :created :runnable :running :suspended :dead))
   ;; Control stack (mmap'd region)
@@ -105,6 +116,11 @@
 ;;;; ===== Fiber Scheduler struct =====
 
 (defstruct (fiber-scheduler (:constructor %make-fiber-scheduler))
+  "A fiber scheduler manages a collection of fibers on a single carrier
+OS thread.  It maintains a run queue of runnable fibers and a waiting
+list of suspended fibers.  The scheduler loop polls wake conditions,
+dispatches runnable fibers, and calls an idle hook when all fibers are
+waiting."
   (carrier nil)
   (run-queue nil :type list)
   (waiting nil :type list)
@@ -129,26 +145,46 @@
 ;;; (build order #146) so that serve-event.lisp (#522) can reference them.
 
 (declaim (inline current-fiber current-scheduler))
-(defun current-fiber () *current-fiber*)
-(defun current-scheduler () *current-scheduler*)
+(defun current-fiber ()
+  "Return the fiber currently running on this thread, or NIL if not
+inside a fiber context."
+  *current-fiber*)
+(defun current-scheduler ()
+  "Return the fiber scheduler running on this thread, or NIL if not
+inside a fiber scheduler loop."
+  *current-scheduler*)
 
 ;;;; ===== Fiber pinning =====
 
 (declaim (inline fiber-can-yield-p))
 (defun fiber-can-yield-p (&optional (fiber (current-fiber)))
+  "Return true if FIBER is able to yield.  A fiber can yield when it is
+not pinned (its pin count is zero).  Defaults to the current fiber."
   (and fiber (zerop (fiber-pin-count fiber))))
 
 (defun fiber-pin (&optional (fiber (current-fiber)))
+  "Increment the pin count of FIBER, preventing it from yielding.
+A pinned fiber will fall through to the OS blocking path for mutex
+acquisition, condition waits, and I/O waits instead of parking.
+Pins nest: each FIBER-PIN must be balanced by a FIBER-UNPIN.
+Defaults to the current fiber."
   (when fiber
     (incf (fiber-pin-count fiber))))
 
 (defun fiber-unpin (&optional (fiber (current-fiber)))
+  "Decrement the pin count of FIBER.  When the count reaches zero, the
+fiber is again able to yield.  Has no effect if the pin count is already
+zero.  Defaults to the current fiber."
   (when fiber
     (let ((count (fiber-pin-count fiber)))
       (when (plusp count)
         (setf (fiber-pin-count fiber) (1- count))))))
 
 (defmacro with-fiber-pinned ((&optional (fiber '(current-fiber))) &body body)
+  "Execute BODY with FIBER pinned, preventing it from yielding.
+The fiber is unpinned when control leaves BODY, whether normally or via
+a non-local exit.  Defaults to the current fiber.  If there is no
+current fiber, BODY is executed normally with no effect."
   (let ((f (gensym "FIBER")))
     `(let ((,f ,fiber))
        (when ,f (fiber-pin ,f))
@@ -349,8 +385,19 @@ fiber_switch 'returns' into fiber_entry_trampoline."
 (defun make-fiber (function &key (name nil)
                                   (stack-size +default-fiber-stack-size+)
                                   (binding-stack-size +default-fiber-binding-stack-size+))
-  "Create a new fiber that will execute FUNCTION when started.
-FUNCTION should be a function of no arguments."
+  "Create a new fiber that will execute FUNCTION when scheduled.
+
+FUNCTION is a function of no arguments.  It will be called when the
+fiber is first dispatched by a scheduler via RUN-FIBER-SCHEDULER.
+
+NAME, if supplied, is a string used for identification in debugging.
+
+STACK-SIZE is the control stack size in bytes (default 64KB).
+BINDING-STACK-SIZE is the binding stack size in bytes (default 16KB).
+Both stacks are allocated via mmap with a guard page.
+
+The returned fiber is in the :CREATED state and must be submitted to
+a scheduler with SUBMIT-FIBER before it will run."
   (let ((cstack-sap (alloc-fiber-stack stack-size))
         (bstack-sap (alloc-fiber-binding-stack binding-stack-size)))
     (when (or (sb-sys:sap= cstack-sap (sb-sys:int-sap 0))
@@ -390,7 +437,12 @@ FUNCTION should be a function of no arguments."
       fiber)))
 
 (defun destroy-fiber (fiber)
-  "Free the resources associated with FIBER. Only call on dead fibers."
+  "Free the memory resources (control stack and binding stack) associated
+with FIBER.  Signals an error if FIBER is not in the :DEAD state.
+
+Normally you do not need to call this directly: the scheduler
+automatically destroys fibers when they finish.  This function is useful
+when you need to eagerly reclaim memory from a dead fiber."
   (unless (eq (fiber-state fiber) :dead)
     (error "Cannot destroy a fiber that is not dead"))
   ;; Free GC info
@@ -482,9 +534,15 @@ Values are raw words stored directly."
 ;;;; ===== Fiber Yield =====
 
 (defun fiber-yield (&optional wake-condition)
-  "Yield the current fiber. If WAKE-CONDITION is provided, it should
-be a function of no arguments that returns true when the fiber is
-ready to be resumed."
+  "Yield the current fiber, returning control to the scheduler.
+
+If WAKE-CONDITION is provided, it must be a function of no arguments.
+The fiber will be placed on the scheduler's waiting list and will not
+be rescheduled until WAKE-CONDITION returns true.  If WAKE-CONDITION
+is NIL, the fiber is placed directly back on the run queue.
+
+Signals an error if called outside of a fiber context or if the fiber
+is pinned (see FIBER-PIN)."
   (let ((fiber (current-fiber))
         (sched (current-scheduler)))
     (unless (and fiber sched)
@@ -679,7 +737,13 @@ back to the scheduler."
 ;;;; ===== Scheduler =====
 
 (defun make-fiber-scheduler (&key idle-hook)
-  "Create a new fiber scheduler for the current thread."
+  "Create a new fiber scheduler.
+
+IDLE-HOOK, if supplied, is a function of one argument (the scheduler)
+that is called when no fibers are runnable but some are waiting.  It
+should perform I/O multiplexing or sleeping to avoid busy-waiting.
+The default idle hook uses epoll (Linux), kqueue (BSD/macOS), or
+serve-event as a fallback."
   (let ((sched (%make-fiber-scheduler
                 :carrier *current-thread*
                 :idle-hook idle-hook)))
@@ -693,14 +757,20 @@ back to the scheduler."
     sched))
 
 (defun submit-fiber (scheduler fiber)
-  "Submit a fiber to a scheduler for execution."
+  "Submit FIBER to SCHEDULER for execution.  The fiber is placed on the
+scheduler's run queue and will be started on the next iteration of
+RUN-FIBER-SCHEDULER."
   (setf (fiber-scheduler fiber) scheduler
         (fiber-state fiber) :runnable)
   (push fiber (fiber-scheduler-run-queue scheduler)))
 
 (defun run-fiber-scheduler (scheduler)
-  "Run the scheduler loop on the current thread. Returns when all
-fibers have completed."
+  "Run SCHEDULER's dispatch loop on the current thread.
+
+The loop repeatedly: checks waiting fibers' wake conditions, dispatches
+the next runnable fiber, and calls the idle hook when no fibers are
+runnable.  Returns when all fibers have completed (both the run queue
+and waiting list are empty).  Dead fibers are automatically destroyed."
   (setf (fiber-scheduler-carrier scheduler) *current-thread*)
   ;; Install the C trampoline if not done yet
   (install-fiber-trampoline)
@@ -761,21 +831,28 @@ fibers have completed."
 ;;;; ===== Convenience API =====
 
 (defun fiber-sleep (seconds)
-  "Sleep the current fiber for SECONDS (can be fractional).
-Only works within a fiber context."
+  "Suspend the current fiber for approximately SECONDS (which may be
+fractional).  Other fibers on the same scheduler continue to run while
+this fiber sleeps.  Must be called from within a fiber context."
   (let ((deadline (+ (get-internal-real-time)
                      (truncate (* seconds internal-time-units-per-second)))))
     (fiber-yield (lambda () (>= (get-internal-real-time) deadline)))))
 
 (defun fiber-alive-p (fiber)
-  "Return true if the fiber has not yet finished."
+  "Return true if FIBER has not yet finished (i.e., its state is not :DEAD)."
   (not (eq (fiber-state fiber) :dead)))
 
 ;;;; ===== Pinned-blocking check =====
 
 (defvar *pinned-blocking-action* :warn
-  "Action when a pinned fiber hits a blocking primitive.
-:WARN emits a warning, :ERROR signals an error, NIL does nothing.")
+  "Controls the behavior when a pinned fiber attempts a blocking
+operation (mutex acquisition, condition wait, or I/O wait) that would
+normally yield.
+
+Possible values:
+- :WARN  -- emit a warning and fall through to the OS blocking path
+- :ERROR -- signal an error
+- NIL    -- silently fall through to the OS blocking path")
 
 (defun check-pinned-blocking (operation)
   "Check-and-signal when a pinned fiber attempts to block on OPERATION."
@@ -789,8 +866,12 @@ Only works within a fiber context."
 ;;;; ===== fiber-park: general-purpose park with timeout =====
 
 (defun fiber-park (predicate &key timeout)
-  "Park current fiber until PREDICATE returns true or TIMEOUT (seconds) expires.
-Returns T if predicate satisfied, NIL on timeout."
+  "Park the current fiber until PREDICATE returns true, or until TIMEOUT
+seconds have elapsed.  PREDICATE is a function of no arguments that is
+polled by the scheduler each iteration.
+
+Returns T if PREDICATE was satisfied, or NIL if the timeout expired
+before PREDICATE returned true.  If TIMEOUT is NIL, waits indefinitely."
   (let ((deadline (when timeout
                     (+ (get-internal-real-time)
                        (truncate (* timeout internal-time-units-per-second))))))
@@ -807,8 +888,11 @@ Returns T if predicate satisfied, NIL on timeout."
 ;;;; ===== fiber-join =====
 
 (defun fiber-join (target &key timeout)
-  "Block current fiber until TARGET fiber completes. Returns fiber-result
-or NIL on timeout."
+  "Wait for TARGET fiber to complete and return its result value.
+
+Suspends the current fiber until TARGET enters the :DEAD state.  If
+TIMEOUT (in seconds) is supplied and expires before TARGET finishes,
+returns NIL.  Signals an error if a fiber attempts to join itself."
   (when (eq target (current-fiber))
     (error "Fiber cannot join itself"))
   (unless (eq (fiber-state target) :dead)
@@ -876,7 +960,9 @@ when fiber is pinned (caller should use the OS blocking path)."
 ;;;; ===== Fiber-aware I/O =====
 
 (defun fd-ready-p (fd direction)
-  "Non-blocking check: is FD usable for DIRECTION (:input or :output)?"
+  "Return true if file descriptor FD is immediately ready for DIRECTION
+(:INPUT or :OUTPUT) without blocking.  Uses poll(2) with a zero timeout
+on Unix, or handle-listen on Windows."
   #+win32
   (if (eq direction :output)
       t  ; Windows always reports output as ready
@@ -1049,8 +1135,15 @@ or NIL if no time-based deadlines exist."
       (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000)))))
 
 (defun fiber-io-idle-hook (scheduler)
-  "Idle hook that polls fds from waiting fibers using a single poll/select call.
-Called when no fibers are runnable but some are waiting."
+  "The default idle hook for fiber schedulers.
+
+Collects file descriptors from all waiting fibers that have I/O wait
+info, then performs a single batched poll using epoll (Linux), kqueue
+(BSD/macOS), or serve-event as a fallback.  For fibers waiting on
+timers only (no fd), sleeps briefly.
+
+This function is suitable as the IDLE-HOOK argument to
+MAKE-FIBER-SCHEDULER, or can be called from a custom idle hook."
   (let ((timeout-ms (or (compute-nearest-deadline scheduler) 100))
         (has-io-waiters nil))
     ;; Check if any waiting fibers have I/O wait info

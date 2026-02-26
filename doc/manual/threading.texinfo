@@ -23,6 +23,7 @@ these platforms threads must be explicitly enabled at build-time, see
 * Mutex Support::
 * Semaphores::
 * Waitqueue/condition variables::
+* Fibers::
 * Barriers::
 * Sessions/Debugging::
 * Foreign threads::
@@ -270,6 +271,137 @@ it.
 @include fun-sb-thread-condition-wait.texinfo
 @include fun-sb-thread-condition-notify.texinfo
 @include fun-sb-thread-condition-broadcast.texinfo
+
+@node Fibers
+@comment  node-name,  next,  previous,  up
+@section Fibers
+
+Fibers (also known as virtual threads, green threads, or coroutines)
+are lightweight cooperative threads that multiplex onto carrier OS
+threads.  They are useful for highly concurrent I/O-bound workloads
+where thousands of concurrent tasks are needed without the overhead of
+OS threads.
+
+Fibers are available on platforms with the @code{:sb-fiber} feature
+(currently x86-64, ARM64, and ARM).
+
+Each fiber has its own control stack and binding stack.  Context
+switches between fibers save and restore only callee-saved registers
+via architecture-specific assembly, with no kernel transition.  Dynamic
+variable bindings made within a fiber are local to that fiber and are
+properly saved and restored across yields.
+
+Fibers cooperatively yield control back to a scheduler, which manages a
+collection of fibers on a single carrier thread.  Fibers that are
+waiting for I/O, timeouts, or other conditions are automatically
+suspended and resumed by the scheduler.
+
+SBCL's standard blocking primitives (@code{grab-mutex},
+@code{condition-wait}, @code{wait-until-fd-usable}) are fiber-aware:
+when called from within a fiber, they transparently yield instead of
+blocking the carrier thread.
+
+@subsection Basic Usage
+
+@lisp
+(let ((sched (sb-thread:make-fiber-scheduler)))
+  (sb-thread:submit-fiber
+   sched
+   (sb-thread:make-fiber
+    (lambda () (format t "Hello from fiber 1~%"))))
+  (sb-thread:submit-fiber
+   sched
+   (sb-thread:make-fiber
+    (lambda () (format t "Hello from fiber 2~%"))))
+  (sb-thread:run-fiber-scheduler sched))
+@end lisp
+
+@subsection Fiber Objects
+
+@include struct-sb-thread-fiber.texinfo
+@include fun-sb-thread-make-fiber.texinfo
+@include fun-sb-thread-destroy-fiber.texinfo
+@include fun-sb-thread-fiber-alive-p.texinfo
+@include fun-sb-thread-fiber-name.texinfo
+@include fun-sb-thread-fiber-state.texinfo
+@include fun-sb-thread-fiber-result.texinfo
+@include fun-sb-thread-current-fiber.texinfo
+@include var-sb-thread-star-current-fiber-star.texinfo
+
+@subsection Yielding and Waiting
+
+@include fun-sb-thread-fiber-yield.texinfo
+@include fun-sb-thread-fiber-sleep.texinfo
+@include fun-sb-thread-fiber-park.texinfo
+@include fun-sb-thread-fiber-join.texinfo
+
+@subsection Fiber Pinning
+
+A pinned fiber is prevented from yielding.  When a pinned fiber
+encounters a blocking operation (such as mutex acquisition), it falls
+through to the OS blocking path instead of yielding.  This is useful
+when holding resources that cannot be safely released across a yield,
+such as foreign memory or OS-level locks.
+
+@include fun-sb-thread-fiber-pin.texinfo
+@include fun-sb-thread-fiber-unpin.texinfo
+@include fun-sb-thread-fiber-can-yield-p.texinfo
+@include macro-sb-thread-with-fiber-pinned.texinfo
+@include var-sb-thread-star-pinned-blocking-action-star.texinfo
+
+@subsection Scheduling
+
+@include struct-sb-thread-fiber-scheduler.texinfo
+@include fun-sb-thread-make-fiber-scheduler.texinfo
+@include fun-sb-thread-submit-fiber.texinfo
+@include fun-sb-thread-run-fiber-scheduler.texinfo
+
+@subsection I/O Integration
+
+Fibers integrate with SBCL's I/O system.  When
+@code{wait-until-fd-usable} is called from within a fiber, the fiber
+yields and is automatically resumed when the file descriptor becomes
+ready.  The scheduler uses epoll (Linux), kqueue (BSD/macOS), or
+@code{serve-event} as a fallback for efficient I/O multiplexing.
+
+@include fun-sb-thread-fd-ready-p.texinfo
+@include fun-sb-thread-fiber-io-idle-hook.texinfo
+@include struct-sb-thread-fiber-wait-info.texinfo
+
+@subsection Example: Concurrent I/O
+
+@lisp
+(defun fiber-echo-server (port)
+  "Run a simple echo server with one fiber per connection."
+  (let* ((sched (sb-thread:make-fiber-scheduler))
+         (server (sb-bsd-sockets:make-inet-socket :stream :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address server) t)
+    (sb-bsd-sockets:socket-bind server #(127 0 0 1) port)
+    (sb-bsd-sockets:socket-listen server 5)
+    ;; Acceptor fiber
+    (sb-thread:submit-fiber sched
+      (sb-thread:make-fiber
+       (lambda ()
+         (loop repeat 3  ; accept 3 connections then stop
+               do (let* ((fd (sb-bsd-sockets:socket-file-descriptor server))
+                         (client (progn
+                                   (sb-sys:wait-until-fd-usable fd :input nil)
+                                   (sb-bsd-sockets:socket-accept server))))
+                    ;; Spawn a handler fiber per connection
+                    (sb-thread:submit-fiber
+                     (sb-thread:current-scheduler)
+                     (sb-thread:make-fiber
+                      (lambda ()
+                        (let ((stream (sb-bsd-sockets:socket-make-stream
+                                       client :input t :output t)))
+                          (unwind-protect
+                               (loop for line = (read-line stream nil)
+                                     while line
+                                     do (write-line line stream)
+                                        (force-output stream))
+                            (close stream)))))))))))
+    (sb-thread:run-fiber-scheduler sched)))
+@end lisp
 
 @node Barriers
 @comment  node-name,  next,  previous,  up
