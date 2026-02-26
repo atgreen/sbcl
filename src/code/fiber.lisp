@@ -658,6 +658,26 @@ Values are raw words stored directly."
         (setf (sb-sys:sap-ref-word thread-sap (aref indices i))
               (aref values i))))))
 
+(defun update-binding-stack-carrier-values (fiber thread-sap)
+  "Update the binding stack's outermost old_values to reflect the current
+carrier's TLS values.  When a fiber migrates between carriers via work-stealing,
+the binding stack still contains the old carrier's TLS values as old_values.
+This must be called before restoring the fiber's TLS overlay so that both
+the yield path and the death path see correct carrier values."
+  (let* ((bsp (sb-sys:int-sap (fiber-binding-stack-pointer fiber)))
+         (bs-start (sb-sys:int-sap (fiber-binding-stack-start fiber)))
+         (seen nil))
+    (let ((ptr bs-start))
+      (loop while (sb-sys:sap< ptr bsp)
+            do (let ((tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
+                 (when (and (plusp tls-index)
+                            (not (member tls-index seen)))
+                   (push tls-index seen)
+                   ;; Overwrite old_value with current carrier's TLS value
+                   (setf (sb-sys:sap-ref-word ptr 0)
+                         (sb-sys:sap-ref-word thread-sap tls-index))))
+               (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
+
 ;;;; ===== Fiber Yield =====
 
 (defun fiber-yield (&optional wake-condition)
@@ -796,6 +816,12 @@ ready to be resumed."
             (fiber-saved-catch-block fiber))
       (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
             (fiber-saved-unwind-protect-block fiber))
+      ;; 3c. Update binding stack carrier values for migration.
+      ;;     When a fiber migrates between carriers, the binding stack's
+      ;;     outermost old_values still reflect the old carrier's TLS.
+      ;;     Patch them to the current carrier's values before restoring
+      ;;     the TLS overlay, so yield/death paths see correct state.
+      (update-binding-stack-carrier-values fiber thread-sap)
       ;; 4. Replay fiber's TLS overlay
       (restore-fiber-tls-overlay fiber)
       ;; 5. Unregister fiber from GC (it's now running on carrier)
@@ -855,44 +881,49 @@ back to the scheduler."
     ;; a captured variable.  The fiber may have migrated between carriers
     ;; (via work-stealing), so the scheduler at creation time may differ
     ;; from the current one.
-    (setf (fiber-state fiber) :dead)
-    (let* ((scheduler (fiber-scheduler fiber))
-           (thread-sap (current-thread-sap))
-           (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
-                            sb-vm:word-shift))
-           (catch-offset (%catch-block-tls-offset))
-           (uwp-offset (%uwp-block-tls-offset))
-           (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
-           (bs-start (fiber-binding-stack-start fiber)))
-      ;; If there are remaining binding stack entries, restore carrier
-      ;; TLS values from outermost old_values (same approach as yield)
-      (when (> current-bsp bs-start)
-        (let ((bsp-sap (sb-sys:int-sap current-bsp))
-              (start-sap (sb-sys:int-sap bs-start))
-              (seen nil))
-          (let ((ptr start-sap))
-            (loop while (sb-sys:sap< ptr bsp-sap)
-                  do (let ((old-value (sb-sys:sap-ref-word ptr 0))
-                           (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
-                       (when (and (plusp tls-index)
-                                  (not (member tls-index seen)))
-                         (push tls-index seen)
-                         (setf (sb-sys:sap-ref-word thread-sap tls-index)
-                               old-value)))
-                  (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
-      ;; Restore carrier's BSP and catch/UWP blocks
-      (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
-            (fiber-scheduler-carrier-bsp scheduler))
-      (setf (sb-sys:sap-ref-word thread-sap catch-offset)
-            (fiber-scheduler-carrier-catch-block scheduler))
-      (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
-            (fiber-scheduler-carrier-unwind-protect-block scheduler))
-      ;; Switch back to scheduler
-      (%fiber-switch (fiber-saved-rsp-addr fiber)
-                    (scheduler-saved-rsp-addr scheduler)
-                    0)
-      ;; Should not reach here
-      (error "fiber-trampoline: fiber_switch returned (unreachable)"))))
+    ;; Wrapped in without-interrupts to prevent GC stop signals from
+    ;; arriving while thread state (TLS, BSP, catch/UWP) is partially
+    ;; restored — a GC during this window sees inconsistent state.
+    (sb-sys:without-interrupts
+      (setf (fiber-state fiber) :dead)
+      (let* ((scheduler (fiber-scheduler fiber))
+             (thread-sap (current-thread-sap))
+             (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
+                              sb-vm:word-shift))
+             (catch-offset (%catch-block-tls-offset))
+             (uwp-offset (%uwp-block-tls-offset))
+             (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
+             (bs-start (fiber-binding-stack-start fiber)))
+        ;; If there are remaining binding stack entries, restore carrier
+        ;; TLS values from outermost old_values (same approach as yield)
+        (when (> current-bsp bs-start)
+          (let ((bsp-sap (sb-sys:int-sap current-bsp))
+                (start-sap (sb-sys:int-sap bs-start))
+                (seen nil))
+            (let ((ptr start-sap))
+              (loop while (sb-sys:sap< ptr bsp-sap)
+                    do (let ((old-value (sb-sys:sap-ref-word ptr 0))
+                             (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
+                         (when (and (plusp tls-index)
+                                    (not (member tls-index seen)))
+                           (push tls-index seen)
+                           (setf (sb-sys:sap-ref-word thread-sap tls-index)
+                                 old-value)))
+                    (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
+        ;; Restore carrier's BSP and catch/UWP blocks
+        (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
+              (fiber-scheduler-carrier-bsp scheduler))
+        (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+              (fiber-scheduler-carrier-catch-block scheduler))
+        (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+              (fiber-scheduler-carrier-unwind-protect-block scheduler))
+        ;; Switch back to scheduler
+        (%fiber-switch (fiber-saved-rsp-addr fiber)
+                      (scheduler-saved-rsp-addr scheduler)
+                      0)
+        ;; Should not reach here
+        (error "fiber-trampoline: fiber_switch returned (unreachable)")))))
+
 
 ;;;; ===== Register the Lisp trampoline with C =====
 
