@@ -431,16 +431,6 @@ fiber_run_and_finish(lispobj fiber_lispobj)
 /* Lisp-callable trampoline function, set from Lisp side */
 lispobj fiber_run_trampoline = 0;
 
-/* Return the address of fiber_entry_trampoline (for Lisp to read) */
-uword_t
-get_fiber_entry_trampoline_addr(void)
-{
-#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_ARM)
-    return (uword_t)fiber_entry_trampoline;
-#else
-    return 0;  /* Fibers not yet supported on this architecture */
-#endif
-}
 
 /* Set the Lisp trampoline function (called from Lisp) */
 void

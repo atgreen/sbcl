@@ -2532,3 +2532,9 @@
 
 (defknown sb-kernel::single-float-invalid-operation (t single-float) nil (fixed-args))
 (defknown sb-kernel::double-float-invalid-operation (t double-float) nil (fixed-args))
+
+;;; Fiber context switch (assembly routine).
+;;; Takes raw word addresses/pointers; the VOP handles unboxing.
+#+sb-fiber
+(defknown sb-thread::%fiber-switch (word word word) (values)
+  (always-translatable))

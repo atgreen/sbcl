@@ -16,7 +16,7 @@ LD=${TOOLCHAIN}/${TARGET_TAG}/bin/ld
 
 # NDK implements pthread in libc so there is no need to add it to OS_LIBS
 
-ASSEM_SRC = x86-64-assem.S x86-64-fiber.S
+ASSEM_SRC = x86-64-assem.S
 ARCH_SRC = x86-64-arch.c
 
 OS_SRC = linux-os.c linux-mman.c x86-64-linux-os.c android-os.c x86-64-android-os.c

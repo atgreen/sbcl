@@ -9,7 +9,7 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-ASSEM_SRC = arm-assem.S arm-fiber.S
+ASSEM_SRC = arm-assem.S
 ARCH_SRC = arm-arch.c
 
 OS_SRC = bsd-os.c arm-bsd-os.c

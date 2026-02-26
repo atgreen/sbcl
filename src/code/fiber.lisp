@@ -33,11 +33,6 @@
 (define-alien-routine "free_fiber_gc_info"
     void (info system-area-pointer))
 
-(define-alien-routine "fiber_switch"
-    void
-  (old-rsp-slot unsigned-long)
-  (new-rsp-slot unsigned-long)
-  (thread-ptr unsigned-long))
 
 (define-alien-routine "enter_fiber_gc_context"
     void
@@ -284,12 +279,9 @@ Returns an unsigned integer (no SAP allocation)."
 
 ;;;; ===== Stack initialization =====
 
-(define-alien-routine "get_fiber_entry_trampoline_addr"
-    unsigned-long)
-
 (defun fiber-entry-trampoline-address ()
-  "Return the address of fiber_entry_trampoline (C/asm symbol)."
-  (get-fiber-entry-trampoline-addr))
+  "Return the address of the fiber-entry-trampoline assembly routine."
+  (sb-fasl:get-asm-routine 'sb-vm::fiber-entry-trampoline))
 
 (defun initialize-fiber-stack (fiber)
   "Set up the initial stack frame for a brand-new fiber so that
@@ -434,7 +426,38 @@ fiber_switch 'returns' into fiber_entry_trampoline."
           (setf (sb-sys:sap-ref-word sap -64) 0)  ; -> r14
           (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r15
           ;; Initial RSP = stack_top - 72 (6 regs * 8 + return addr + padding)
-          (setf (fiber-saved-rsp fiber) (- stack-top 72)))))))
+          (setf (fiber-saved-rsp fiber) (- stack-top 72))))
+
+      #+ppc64
+      ;; PPC64 (ELFv2): 320-byte frame.
+      ;; fiber-switch saves: LR, CR, r14-r31 (18 GPRs), f14-f31 (18 FPRs).
+      ;; Initial frame has trampoline in LR slot, fiber_lispobj in r15 (cfp) slot.
+      ;;
+      ;; Frame layout (offsets from frame base = saved SP):
+      ;;   +0:   backchain (0)
+      ;;   +8:   LR = trampoline_addr
+      ;;   +16:  CR = 0
+      ;;   +24:  r14 = 0 (bsp)
+      ;;   +32:  r15 = fiber_lispobj (cfp, used by trampoline)
+      ;;   +40..+160: r16-r31 = 0
+      ;;   +168..+304: f14-f31 = 0
+      ;;   +312..+319: padding
+      ;;   saved SP = stack_top - 320
+      (let ((base (- stack-top 320)))
+        (let ((base-sap (sb-sys:int-sap base)))
+          ;; Backchain, LR, CR
+          (setf (sb-sys:sap-ref-word base-sap 0) 0)               ; backchain
+          (setf (sb-sys:sap-ref-word base-sap 8) trampoline-addr) ; LR
+          (setf (sb-sys:sap-ref-word base-sap 16) 0)              ; CR
+          ;; GPRs r14-r31 (18 regs at offsets 24..160)
+          (loop for offset from 24 to 160 by 8
+                do (setf (sb-sys:sap-ref-word base-sap offset) 0))
+          ;; r15 (cfp) = fiber lispobj, at offset 32
+          (setf (sb-sys:sap-ref-word base-sap 32) fiber-lispobj)
+          ;; FPRs f14-f31 (18 regs at offsets 168..304)
+          (loop for offset from 168 to 304 by 8
+                do (setf (sb-sys:sap-ref-word base-sap offset) 0))
+          (setf (fiber-saved-rsp fiber) base))))))
 
 ;;;; ===== Fiber creation =====
 
@@ -634,7 +657,7 @@ ready to be resumed."
         ;;    NOTE: GC registration happens in resume-fiber-internal step 8,
         ;;    AFTER fiber_switch returns, when saved-rsp has the correct value.
         ;;    We must NOT register here because fiber_switch hasn't saved RSP yet.
-        (fiber-switch (fiber-saved-rsp-addr fiber)
+        (%fiber-switch (fiber-saved-rsp-addr fiber)
                       (scheduler-saved-rsp-addr sched)
                       0)
         ;; Returns here when fiber is resumed
@@ -743,7 +766,7 @@ ready to be resumed."
         ;;    On x86-64 without :gs-seg, r13 holds the thread pointer;
         ;;    when a fiber migrates between carriers, the saved r13
         ;;    would point to the old carrier's thread struct.
-        (fiber-switch (scheduler-saved-rsp-addr scheduler)
+        (%fiber-switch (scheduler-saved-rsp-addr scheduler)
                       (fiber-saved-rsp-addr fiber)
                       (sb-sys:sap-int thread-sap))
         ;; Returns here when fiber yields or dies
@@ -822,7 +845,7 @@ back to the scheduler."
       (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
             (fiber-scheduler-carrier-unwind-protect-block scheduler))
       ;; Switch back to scheduler
-      (fiber-switch (fiber-saved-rsp-addr fiber)
+      (%fiber-switch (fiber-saved-rsp-addr fiber)
                     (scheduler-saved-rsp-addr scheduler)
                     0)
       ;; Should not reach here

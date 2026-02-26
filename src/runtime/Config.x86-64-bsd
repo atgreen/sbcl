@@ -10,7 +10,7 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-ASSEM_SRC = x86-64-assem.S x86-64-fiber.S
+ASSEM_SRC = x86-64-assem.S
 ARCH_SRC = x86-64-arch.c
 
 OS_SRC = bsd-os.c x86-64-bsd-os.c

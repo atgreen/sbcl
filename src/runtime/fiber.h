@@ -93,12 +93,6 @@ void scavenge_fiber_binding_stacks(int compacting_p, void (*mark_fun)(lispobj));
 /* Fiber guard page detection (called from signal handler) */
 int check_fiber_guard_page(os_vm_address_t addr);
 
-/* Assembly routines */
-#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_ARM)
-extern void fiber_switch(void* old_sp_slot, void* new_sp_slot, void* thread_ptr);
-extern void fiber_entry_trampoline(void);
-#endif
-
 /* C trampoline called from assembly */
 void fiber_run_and_finish(lispobj fiber_lispobj);
 
