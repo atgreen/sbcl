@@ -146,7 +146,7 @@ free_fiber_gc_info(struct fiber_gc_info* info)
     free(info);
 }
 
-/* ===== Active fiber GC context ===== */
+/* ===== Per-thread active fiber GC context ===== */
 
 /*
  * When a fiber is running on a carrier thread, RSP and BSP point into
@@ -154,16 +154,79 @@ free_fiber_gc_info(struct fiber_gc_info* info)
  *   1. The fiber's stack boundaries (to scan the active fiber's stack)
  *   2. The carrier's suspended stack info (to scan the carrier's stack)
  *
- * These globals are set before fiber_switch (entering a fiber) and
- * cleared after fiber_switch returns (leaving a fiber).
+ * Each carrier thread gets its own active_fiber_context, linked into
+ * a global list for GC to iterate during stop-the-world.
  */
 
-lispobj* gc_active_fiber_stack_start = NULL;
-lispobj* gc_active_fiber_stack_end = NULL;
-lispobj* gc_active_fiber_binding_stack_start = NULL;
+static struct active_fiber_context* all_active_fiber_contexts = NULL;
+static fiber_lock_t active_fiber_context_lock;
+static int active_fiber_context_lock_initialized = 0;
 
-/* gc_info for the carrier's suspended state while a fiber runs */
-static struct fiber_gc_info gc_carrier_stack_info;
+/* Per-thread cached context (allocated once, reused across fiber switches) */
+#ifdef LISP_FEATURE_GCC_TLS
+static __thread struct active_fiber_context* my_active_fiber_context = NULL;
+#elif defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
+static pthread_key_t active_fiber_context_key;
+static int active_fiber_context_key_initialized = 0;
+#endif
+
+static void ensure_active_fiber_context_lock(void)
+{
+    if (!active_fiber_context_lock_initialized) {
+        FIBER_LOCK_INIT(active_fiber_context_lock);
+        active_fiber_context_lock_initialized = 1;
+#if !defined(LISP_FEATURE_GCC_TLS) && defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
+        if (!active_fiber_context_key_initialized) {
+            pthread_key_create(&active_fiber_context_key, NULL);
+            active_fiber_context_key_initialized = 1;
+        }
+#endif
+    }
+}
+
+static struct active_fiber_context* get_my_context(void)
+{
+#ifdef LISP_FEATURE_GCC_TLS
+    return my_active_fiber_context;
+#elif defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
+    return (struct active_fiber_context*)pthread_getspecific(active_fiber_context_key);
+#else
+    return NULL;
+#endif
+}
+
+static void set_my_context(struct active_fiber_context* ctx)
+{
+#ifdef LISP_FEATURE_GCC_TLS
+    my_active_fiber_context = ctx;
+#elif defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
+    pthread_setspecific(active_fiber_context_key, ctx);
+#endif
+}
+
+static struct active_fiber_context* get_or_create_context(void)
+{
+    struct active_fiber_context* ctx = get_my_context();
+    if (!ctx) {
+        ctx = malloc(sizeof(struct active_fiber_context));
+        memset(ctx, 0, sizeof(*ctx));
+        set_my_context(ctx);
+    }
+    return ctx;
+}
+
+/* Find active fiber context for a thread.  Called during stop-the-world
+ * GC, so no lock needed (all mutators stopped). */
+struct active_fiber_context*
+find_active_fiber_context(struct thread* th)
+{
+    struct active_fiber_context* ctx;
+    for (ctx = all_active_fiber_contexts; ctx; ctx = ctx->next) {
+        if (ctx->carrier_thread == th)
+            return ctx;
+    }
+    return NULL;
+}
 
 void
 enter_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
@@ -171,30 +234,99 @@ enter_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
                        uword_t carrier_stack_start, uword_t carrier_stack_end,
                        uword_t carrier_bs_start, uword_t carrier_bsp)
 {
-    gc_active_fiber_stack_start = (lispobj*)fiber_stack_start;
-    gc_active_fiber_stack_end = (lispobj*)fiber_stack_end;
-    gc_active_fiber_binding_stack_start = (lispobj*)fiber_bs_start;
+    ensure_active_fiber_context_lock();
+    struct active_fiber_context* ctx = get_or_create_context();
+
+    ctx->carrier_thread = get_sb_vm_thread();
+    ctx->fiber_stack_start = (lispobj*)fiber_stack_start;
+    ctx->fiber_stack_end = (lispobj*)fiber_stack_end;
+    ctx->fiber_binding_stack_start = (lispobj*)fiber_bs_start;
 
     /* Register carrier's binding stack for GC scavenging.
      * Set control_stack_pointer = control_stack_end so the control stack
      * scan loop in gencgc.c sees an empty range (ptr < end is immediately
      * false).  The carrier's control stack is scanned directly by the
      * fiber-aware code in gencgc.c which skips the guard pages. */
-    gc_carrier_stack_info.control_stack_base = (lispobj*)carrier_stack_start;
-    gc_carrier_stack_info.control_stack_pointer = (lispobj*)carrier_stack_end;
-    gc_carrier_stack_info.control_stack_end = (lispobj*)carrier_stack_end;
-    gc_carrier_stack_info.binding_stack_start = (lispobj*)carrier_bs_start;
-    gc_carrier_stack_info.binding_stack_pointer = (lispobj*)carrier_bsp;
-    register_fiber_for_gc(&gc_carrier_stack_info);
+    ctx->carrier_gc_info.control_stack_base = (lispobj*)carrier_stack_start;
+    ctx->carrier_gc_info.control_stack_pointer = (lispobj*)carrier_stack_end;
+    ctx->carrier_gc_info.control_stack_end = (lispobj*)carrier_stack_end;
+    ctx->carrier_gc_info.binding_stack_start = (lispobj*)carrier_bs_start;
+    ctx->carrier_gc_info.binding_stack_pointer = (lispobj*)carrier_bsp;
+    register_fiber_for_gc(&ctx->carrier_gc_info);
+
+    /* Link into global list */
+    FIBER_LOCK(active_fiber_context_lock);
+    ctx->next = all_active_fiber_contexts;
+    ctx->prev = NULL;
+    if (all_active_fiber_contexts)
+        all_active_fiber_contexts->prev = ctx;
+    all_active_fiber_contexts = ctx;
+    FIBER_UNLOCK(active_fiber_context_lock);
 }
 
 void
 leave_fiber_gc_context(void)
 {
-    unregister_fiber_for_gc(&gc_carrier_stack_info);
-    gc_active_fiber_stack_start = NULL;
-    gc_active_fiber_stack_end = NULL;
-    gc_active_fiber_binding_stack_start = NULL;
+    struct active_fiber_context* ctx = get_my_context();
+    if (!ctx) return;
+
+    unregister_fiber_for_gc(&ctx->carrier_gc_info);
+
+    /* Unlink from global list */
+    FIBER_LOCK(active_fiber_context_lock);
+    if (ctx->prev)
+        ctx->prev->next = ctx->next;
+    else
+        all_active_fiber_contexts = ctx->next;
+    if (ctx->next)
+        ctx->next->prev = ctx->prev;
+    FIBER_UNLOCK(active_fiber_context_lock);
+
+    /* Clear fiber fields but keep ctx allocated for reuse */
+    ctx->carrier_thread = NULL;
+    ctx->fiber_stack_start = NULL;
+    ctx->fiber_stack_end = NULL;
+    ctx->fiber_binding_stack_start = NULL;
+    ctx->next = NULL;
+    ctx->prev = NULL;
+}
+
+/* ===== Fiber guard page detection ===== */
+
+int
+check_fiber_guard_page(os_vm_address_t addr)
+{
+    size_t ps = os_vm_page_size;
+
+    /* Check active fiber contexts (fibers currently running on carriers) */
+    struct active_fiber_context* ctx;
+    for (ctx = all_active_fiber_contexts; ctx; ctx = ctx->next) {
+        lispobj* stack_start = ctx->fiber_stack_start;
+        if (stack_start) {
+            os_vm_address_t guard_start = (os_vm_address_t)stack_start - ps;
+            if (addr >= guard_start && addr < (os_vm_address_t)stack_start) {
+                lose("Fiber control stack exhausted (fault: %p, fiber stack: %p-%p)",
+                     addr, stack_start, ctx->fiber_stack_end);
+                return 1;
+            }
+        }
+    }
+
+    /* Check suspended fibers (in the GC list) */
+    struct fiber_gc_info* fi;
+    for (fi = all_fiber_gc_info; fi; fi = fi->next) {
+        lispobj* base = fi->control_stack_base;
+        if (base) {
+            os_vm_address_t guard_start = (os_vm_address_t)base - ps;
+            if (addr >= guard_start && addr < (os_vm_address_t)base) {
+                lose("Fiber control stack exhausted (fault: %p, fiber stack: %p-%p)",
+                     addr, base, fi->control_stack_end);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 /* ===== GC scanning of suspended fiber stacks ===== */

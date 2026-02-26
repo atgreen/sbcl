@@ -68,6 +68,7 @@
 #include "genesis/cons.h"
 #include "genesis/vector.h"
 #include "genesis/thread.h"
+#include "fiber.h"
 #include "atomiclog.inc"
 
 #ifdef ATOMIC_LOGGING
@@ -1790,6 +1791,9 @@ bool handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
              addr < undefined_alien_address + os_vm_page_size) {
         arrange_return_to_lisp_function
             (context, StaticSymbolFunction(UNDEFINED_ALIEN_VARIABLE_ERROR));
+        return 1;
+    }
+    else if (check_fiber_guard_page(addr)) {
         return 1;
     }
     else return 0;

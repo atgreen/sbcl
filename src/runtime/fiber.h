@@ -51,13 +51,22 @@ struct fiber_gc_info {
 extern struct fiber_gc_info* all_fiber_gc_info;
 extern fiber_lock_t fiber_gc_lock;
 
-/* State for GC when a fiber is actively running on a carrier thread.
+/* Per-carrier-thread context for GC when a fiber is actively running.
+ * One entry per carrier thread, linked into a global list.
  * Set by enter_fiber_gc_context() before fiber_switch, cleared by
  * leave_fiber_gc_context() after fiber_switch returns. */
-extern lispobj* gc_active_fiber_stack_start;
-extern lispobj* gc_active_fiber_stack_end;
-extern lispobj* gc_active_fiber_binding_stack_start;
-/* carrier_gc_info is registered to scan the carrier's suspended stack */
+struct active_fiber_context {
+    struct thread* carrier_thread;
+    lispobj* fiber_stack_start;
+    lispobj* fiber_stack_end;
+    lispobj* fiber_binding_stack_start;
+    struct fiber_gc_info carrier_gc_info;
+    struct active_fiber_context* next;
+    struct active_fiber_context* prev;
+};
+
+/* Find the active fiber context for a given thread (during stop-the-world GC) */
+struct active_fiber_context* find_active_fiber_context(struct thread* th);
 
 /* Called from Lisp (via alien-routine) around fiber_switch */
 void enter_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
@@ -80,6 +89,9 @@ void free_fiber_gc_info(struct fiber_gc_info* info);
 /* Scan all suspended fiber stacks during GC */
 void scan_fiber_stacks(void);
 void scavenge_fiber_binding_stacks(int compacting_p, void (*mark_fun)(lispobj));
+
+/* Fiber guard page detection (called from signal handler) */
+int check_fiber_guard_page(os_vm_address_t addr);
 
 /* Assembly routines */
 #if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_ARM)

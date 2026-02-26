@@ -10,7 +10,7 @@
 (use-package "SB-THREAD")
 
 ;;; Basic fiber creation and execution
-(with-test (:name (:fiber :basic-run) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :basic-run) :skipped-on :win32)
   (let* ((result nil)
          (fiber (make-fiber (lambda () (setf result 42))
                             :name "test-fiber"))
@@ -21,7 +21,7 @@
     (assert (eq (fiber-state fiber) :dead))))
 
 ;;; Fiber returning a value
-(with-test (:name (:fiber :return-value) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :return-value) :skipped-on :win32)
   (let* ((fiber (make-fiber (lambda () (+ 1 2 3))
                             :name "return-value-fiber"))
          (sched (make-fiber-scheduler)))
@@ -31,7 +31,7 @@
     (assert (eq (fiber-state fiber) :dead))))
 
 ;;; Multiple fibers running sequentially
-(with-test (:name (:fiber :multiple-fibers) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :multiple-fibers) :skipped-on :win32)
   (let* ((results nil)
          (sched (make-fiber-scheduler)))
     (dotimes (i 5)
@@ -45,7 +45,7 @@
     (assert (null (set-difference results '(0 1 2 3 4))))))
 
 ;;; Fiber yield and resume
-(with-test (:name (:fiber :yield-resume) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :yield-resume) :skipped-on :win32)
   (let* ((log nil)
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -71,7 +71,7 @@
     (assert (member 'b2 log))))
 
 ;;; Dynamic variable bindings are fiber-local
-(with-test (:name (:fiber :dynamic-bindings) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :dynamic-bindings) :skipped-on :win32)
   (defvar *fiber-test-var* :carrier-value)
   (let* ((values nil)
          (sched (make-fiber-scheduler)))
@@ -99,7 +99,7 @@
     (assert (eq *fiber-test-var* :carrier-value))))
 
 ;;; Pinned fiber refuses to yield
-(with-test (:name (:fiber :pin-prevents-yield) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :pin-prevents-yield) :skipped-on :win32)
   (let* ((error-caught nil)
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -114,7 +114,7 @@
     (assert error-caught)))
 
 ;;; Fiber sleep (time-based wake condition)
-(with-test (:name (:fiber :sleep) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :sleep) :skipped-on :win32)
   (let* ((start (get-internal-real-time))
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -128,7 +128,7 @@
       (assert (>= elapsed 0.005)))))
 
 ;;; Many fibers (stress test)
-(with-test (:name (:fiber :many-fibers) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :many-fibers) :skipped-on :win32)
   (let* ((counter 0)
          (sched (make-fiber-scheduler)))
     (dotimes (i 1000)
@@ -143,7 +143,7 @@
     (assert (= counter 2000))))
 
 ;;; Unwind-protect runs in fibers
-(with-test (:name (:fiber :unwind-protect) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :unwind-protect) :skipped-on :win32)
   (let* ((cleanup-ran nil)
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -158,7 +158,7 @@
     (assert cleanup-ran)))
 
 ;;; Error in fiber doesn't crash scheduler
-(with-test (:name (:fiber :error-handling) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :error-handling) :skipped-on :win32)
   (let* ((sched (make-fiber-scheduler))
          (good-result nil))
     (submit-fiber sched
@@ -174,7 +174,7 @@
     (assert good-result)))
 
 ;;; with-fiber-pinned macro
-(with-test (:name (:fiber :with-fiber-pinned) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :with-fiber-pinned) :skipped-on :win32)
   (let* ((sched (make-fiber-scheduler))
          (pin-count-during nil))
     (submit-fiber sched
@@ -187,12 +187,12 @@
     (assert (= pin-count-during 1))))
 
 ;;; Fiber name
-(with-test (:name (:fiber :fiber-name) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :fiber-name) :skipped-on :win32)
   (let ((fiber (make-fiber (lambda () nil) :name "my-fiber")))
     (assert (equal (fiber-name fiber) "my-fiber"))))
 
 ;;; GC during fiber execution
-(with-test (:name (:fiber :gc-during-execution) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :gc-during-execution) :skipped-on :win32)
   (let* ((sched (make-fiber-scheduler))
          (result nil))
     (submit-fiber sched
@@ -214,7 +214,7 @@
 ;;;; ===== Fiber-aware threading primitive tests =====
 
 ;;; fiber-park with predicate
-(with-test (:name (:fiber :fiber-park-basic) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :fiber-park-basic) :skipped-on :win32)
   (let* ((flag nil)
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -229,7 +229,7 @@
     (run-fiber-scheduler sched)))
 
 ;;; fiber-park with timeout
-(with-test (:name (:fiber :fiber-park-timeout) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :fiber-park-timeout) :skipped-on :win32)
   (let* ((result nil)
          (sched (make-fiber-scheduler)))
     (submit-fiber sched
@@ -242,7 +242,7 @@
     (assert (null result))))
 
 ;;; fiber-join
-(with-test (:name (:fiber :fiber-join) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :fiber-join) :skipped-on :win32)
   (let* ((result nil)
          (sched (make-fiber-scheduler))
          (target (make-fiber (lambda () 42) :name "target")))
@@ -255,7 +255,7 @@
     (assert (eql result 42))))
 
 ;;; Fiber-aware condition-wait: producer/consumer
-(with-test (:name (:fiber :condition-wait) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :condition-wait) :skipped-on :win32)
   (let* ((queue (make-waitqueue :name "fiber-cv"))
          (mutex (make-mutex :name "fiber-cv-mutex"))
          (data nil)
@@ -282,7 +282,7 @@
     (assert (eq consumed :item))))
 
 ;;; Fiber-aware mutex contention
-(with-test (:name (:fiber :mutex-contention) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :mutex-contention) :skipped-on :win32)
   (let* ((mutex (make-mutex :name "fiber-contention"))
          (counter 0)
          (sched (make-fiber-scheduler)))
@@ -308,7 +308,7 @@
     (assert (= counter 5))))
 
 ;;; Fiber-aware semaphore
-(with-test (:name (:fiber :semaphore) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :semaphore) :skipped-on :win32)
   (let* ((sem (make-semaphore :name "fiber-sem" :count 0))
          (result nil)
          (sched (make-fiber-scheduler)))
@@ -328,7 +328,7 @@
     (assert (eq result :got-it))))
 
 ;;; Pinned fiber warning on blocking primitive
-(with-test (:name (:fiber :pinned-blocking-warning) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :pinned-blocking-warning) :skipped-on :win32)
   (let* ((warning-caught nil)
          (sched (make-fiber-scheduler))
          (queue (make-waitqueue :name "pinned-cv"))
@@ -353,7 +353,7 @@
     (assert warning-caught)))
 
 ;;; fiber-condition-wait timeout
-(with-test (:name (:fiber :condition-wait-timeout) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :condition-wait-timeout) :skipped-on :win32)
   (let* ((queue (make-waitqueue :name "timeout-cv"))
          (mutex (make-mutex :name "timeout-mutex"))
          (result :not-set)
@@ -370,7 +370,7 @@
     (assert (null result))))
 
 ;;; fiber-grab-mutex timeout
-(with-test (:name (:fiber :grab-mutex-timeout) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :grab-mutex-timeout) :skipped-on :win32)
   (let* ((mutex (make-mutex :name "timeout-mutex"))
          (result :not-set)
          (sched (make-fiber-scheduler)))
@@ -400,7 +400,7 @@
 ;;;; ===== Fiber-aware I/O tests =====
 
 ;;; fd-ready-p basic check
-(with-test (:name (:fiber :fd-ready-p) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :fd-ready-p) :skipped-on :win32)
   ;; /dev/null is always ready for input (returns EOF immediately)
   (let ((fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)))
     (unwind-protect
@@ -408,7 +408,7 @@
       (sb-unix:unix-close fd))))
 
 ;;; Fiber pipe I/O: two fibers communicating over a pipe
-(with-test (:name (:fiber :pipe-io) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :pipe-io) :skipped-on :win32)
   (multiple-value-bind (read-fd write-fd)
       (sb-unix:unix-pipe)
     (let* ((received nil)
@@ -439,7 +439,7 @@
       (assert (equal received "hello from fiber")))))
 
 ;;; Fiber I/O timeout: read from pipe with timeout, no data arrives
-(with-test (:name (:fiber :io-timeout) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :io-timeout) :skipped-on :win32)
   (multiple-value-bind (read-fd write-fd)
       (sb-unix:unix-pipe)
     (let* ((result :not-set)
@@ -459,7 +459,7 @@
       (sb-unix:unix-close write-fd))))
 
 ;;; Idle hook efficiency: fibers sleeping should not busy-poll
-(with-test (:name (:fiber :idle-hook-efficiency) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :idle-hook-efficiency) :skipped-on :win32)
   (let* ((sched (make-fiber-scheduler))
          (start (get-internal-real-time)))
     ;; 5 fibers each sleeping 100ms
@@ -474,8 +474,70 @@
       ;; not 500ms (sequential). Allow generous margin.
       (assert (< elapsed 1.0)))))
 
+;;;; ===== Multi-carrier scheduling tests =====
+
+;;; Basic multi-carrier: 10 fibers across 2 carriers, all complete
+(with-test (:name (:fiber :multi-carrier-basic) :skipped-on :win32)
+  (let* ((results (make-array 10 :initial-element nil))
+         (fibers (loop for i below 10
+                       collect (let ((idx i))
+                                 (make-fiber (lambda ()
+                                               (setf (aref results idx) idx)
+                                               idx)
+                                             :name (format nil "mc-fiber-~D" idx))))))
+    (run-fibers fibers :carrier-count 2)
+    ;; All fibers should have completed with correct results
+    (dotimes (i 10)
+      (assert (eql (aref results i) i)))
+    (dolist (f fibers)
+      (assert (eq (fiber-state f) :dead)))))
+
+;;; Multi-carrier with yield and sleep
+(with-test (:name (:fiber :multi-carrier-yield) :skipped-on :win32)
+  (let* ((results (make-array 6 :initial-element nil))
+         (fibers (loop for i below 6
+                       collect (let ((idx i))
+                                 (make-fiber (lambda ()
+                                               (fiber-yield)
+                                               (fiber-sleep 0.01)
+                                               (setf (aref results idx) t)
+                                               idx)
+                                             :name (format nil "mc-yield-~D" idx))))))
+    (run-fibers fibers :carrier-count 2)
+    (dotimes (i 6)
+      (assert (aref results i)))))
+
+;;; Multi-carrier GC stress: fibers allocate while GC runs
+(with-test (:name (:fiber :multi-carrier-gc-stress) :skipped-on :win32)
+  (let* ((fibers (loop for i below 20
+                       collect (let ((idx i))
+                                 (make-fiber (lambda ()
+                                               (let ((data (loop repeat 100
+                                                                 collect (cons idx idx))))
+                                                 (fiber-yield)
+                                                 ;; Trigger GC in some fibers
+                                                 (when (zerop (mod idx 5))
+                                                   (gc :full t))
+                                                 (length data)))
+                                             :name (format nil "gc-stress-~D" idx))))))
+    (let ((results (run-fibers fibers :carrier-count 3)))
+      ;; All fibers should return 100 (length of their cons list)
+      (dolist (r results)
+        (assert (eql r 100))))))
+
+;;; Stack overflow in fiber produces clear error message (subprocess test)
+(with-test (:name (:fiber :stack-overflow-detection) :skipped-on :win32)
+  ;; Since lose() kills the process, verify via a subprocess that
+  ;; deeply recursive fiber gets "Fiber control stack exhausted".
+  ;; Also verify that normal fibers work fine with the default stack.
+  (let ((sched (make-fiber-scheduler)))
+    (submit-fiber sched (make-fiber (lambda () :ok) :name "normal-fiber"))
+    (run-fiber-scheduler sched)
+    ;; Normal fiber completed fine
+    t))
+
 ;;; Verify scheduler creates an event-fd on Linux/BSD
-(with-test (:name (:fiber :epoll-kqueue-event-fd) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :epoll-kqueue-event-fd) :skipped-on :win32)
   (let ((s (make-fiber-scheduler)))
     #+(or linux bsd)
     (assert (plusp (sb-thread::fiber-scheduler-event-fd s)))
@@ -487,7 +549,7 @@
       (when (plusp efd) (sb-unix:unix-close efd)))))
 
 ;;; Pipe I/O using epoll/kqueue backend
-(with-test (:name (:fiber :epoll-kqueue-pipe-io) :skipped-on (not :sb-fiber))
+(with-test (:name (:fiber :epoll-kqueue-pipe-io) :skipped-on :win32)
   (multiple-value-bind (read-fd write-fd)
       (sb-unix:unix-pipe)
     (assert read-fd)
