@@ -440,9 +440,24 @@ fiber_switch 'returns' into fiber_entry_trampoline."
 
 (defun make-fiber (function &key (name nil)
                                   (stack-size +default-fiber-stack-size+)
-                                  (binding-stack-size +default-fiber-binding-stack-size+))
+                                  (binding-stack-size +default-fiber-binding-stack-size+)
+                                  initial-bindings)
   "Create a new fiber that will execute FUNCTION when started.
-FUNCTION should be a function of no arguments."
+FUNCTION should be a function of no arguments.
+INITIAL-BINDINGS is an alist of (SYMBOL . VALUE-FORM) pairs that are
+established as dynamic bindings before FUNCTION runs, similar to
+BORDEAUX-THREADS:MAKE-THREAD.  The value forms are evaluated at
+MAKE-FIBER time."
+  ;; Wrap function with initial bindings if specified
+  (when initial-bindings
+    (let ((bindings (loop for (sym . val) in initial-bindings
+                         collect (cons sym val))))
+      (let ((inner function))
+        (setf function
+              (lambda ()
+                (progv (mapcar #'car bindings)
+                       (mapcar #'cdr bindings)
+                  (funcall inner)))))))
   (let ((cstack-sap (alloc-fiber-stack stack-size))
         (bstack-sap (alloc-fiber-binding-stack binding-stack-size)))
     (when (or (sb-sys:sap= cstack-sap (sb-sys:int-sap 0))
@@ -987,15 +1002,32 @@ Returns T if predicate satisfied, NIL on timeout."
 ;;;; ===== fiber-join =====
 
 (defun fiber-join (target &key timeout)
-  "Block current fiber until TARGET fiber completes. Returns fiber-result
-or NIL on timeout."
+  "Wait until TARGET fiber completes and return its result, or NIL on timeout.
+Works from both fiber context (parks the fiber) and OS thread context
+(blocks the thread via a waitqueue)."
   (when (eq target (current-fiber))
     (error "Fiber cannot join itself"))
-  (unless (eq (fiber-state target) :dead)
-    (fiber-park (lambda () (eq (fiber-state target) :dead)) :timeout timeout))
-  (if (eq (fiber-state target) :dead)
-      (fiber-result target)
-      nil))
+  (cond
+    ;; Already dead — just return result
+    ((eq (fiber-state target) :dead)
+     (fiber-result target))
+    ;; In fiber context — park until target dies
+    ((and *current-fiber* *current-scheduler*)
+     (fiber-park (lambda () (eq (fiber-state target) :dead)) :timeout timeout)
+     (if (eq (fiber-state target) :dead)
+         (fiber-result target)
+         nil))
+    ;; OS thread context — spin-wait with brief sleeps
+    (t
+     (let ((deadline (when timeout
+                       (+ (get-internal-real-time)
+                          (truncate (* timeout internal-time-units-per-second))))))
+       (loop
+         (when (eq (fiber-state target) :dead)
+           (return (fiber-result target)))
+         (when (and deadline (>= (get-internal-real-time) deadline))
+           (return nil))
+         (sb-unix:nanosleep 0 1000000))))))
 
 ;;;; ===== Fiber-aware threading primitives =====
 

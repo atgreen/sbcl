@@ -707,3 +707,60 @@
       (assert (= (length results) n))
       (dolist (r results)
         (assert (eql r 499500))))))
+
+;;;; ===== fiber-join from OS thread context =====
+
+;;; fiber-join from an OS thread (not inside a fiber)
+(with-test (:name (:fiber :fiber-join-from-thread) :skipped-on :win32)
+  (let* ((target (make-fiber (lambda ()
+                               (dotimes (i 5) (fiber-yield))
+                               :done)
+                             :name "join-target"))
+         (result nil)
+         (sched (make-fiber-scheduler)))
+    (submit-fiber sched target)
+    ;; Run the scheduler on a background thread
+    (let ((worker (make-thread (lambda () (run-fiber-scheduler sched))
+                               :name "join-carrier")))
+      ;; Join the fiber from the main (OS) thread
+      (setf result (fiber-join target))
+      (join-thread worker))
+    (assert (eq result :done))))
+
+;;; fiber-join from OS thread with timeout
+(with-test (:name (:fiber :fiber-join-from-thread-timeout) :skipped-on :win32)
+  (let* ((target (make-fiber (lambda ()
+                               ;; Park long enough that timeout fires
+                               (fiber-park (lambda () nil) :timeout 10))
+                             :name "slow-fiber"))
+         (sched (make-fiber-scheduler)))
+    (submit-fiber sched target)
+    (let ((worker (make-thread (lambda () (run-fiber-scheduler sched))
+                               :name "timeout-carrier")))
+      ;; Join with short timeout — should return NIL
+      (let ((result (fiber-join target :timeout 0.1)))
+        (assert (null result)))
+      ;; Clean up: let the fiber finish by destroying the scheduler thread
+      (terminate-thread worker)
+      (ignore-errors (join-thread worker)))))
+
+;;;; ===== :initial-bindings =====
+
+(defvar *test-fiber-var* :default)
+
+(with-test (:name (:fiber :initial-bindings) :skipped-on :win32)
+  (let* ((results nil)
+         (fibers (list
+                  ;; Fiber with initial binding — sees :fiber-value
+                  (make-fiber (lambda ()
+                                (push *test-fiber-var* results))
+                              :name "bound-fiber"
+                              :initial-bindings '((*test-fiber-var* . :fiber-value)))
+                  ;; Fiber without — sees whatever the carrier has (:default)
+                  (make-fiber (lambda ()
+                                (push *test-fiber-var* results))
+                              :name "unbound-fiber"))))
+    (run-fibers fibers)
+    ;; bound-fiber saw :fiber-value, unbound-fiber saw :default
+    (assert (member :fiber-value results))
+    (assert (member :default results))))

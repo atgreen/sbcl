@@ -1729,5 +1729,8 @@
   (let ((b (& (>> val 3) #x7)))
    (let ((a (>> (<< val 5) 29)))
     (^ a (aref tab b))))))")
+(#(42D83FFB 7EFC3AC8 9FEFBBF3 AD4575D9 DC8F36B0)
+ "(:ALLOW-OTHER-KEYS :INITIAL-BINDINGS :BINDING-STACK-SIZE :STACK-SIZE :NAME)"
+ "((& (+ val (>> val 31)) 7))")
 )
 ;; EOF
