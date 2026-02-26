@@ -20,11 +20,13 @@
         .fpu vfp
 
 /*
- * fiber_switch(void* old_sp_slot, void* new_sp_slot)
+ * fiber_switch(void* old_sp_slot, void* new_sp_slot, void* thread_ptr)
  *
  * AAPCS calling convention:
- *   Arguments: r0, r1
+ *   Arguments: r0, r1, r2
  *   Callee-saved: r4-r11, lr, d8-d15
+ *
+ * thread_ptr (3rd arg): ignored on ARM32 (no threading support).
  *
  * Save callee-saved registers onto the current stack, store SP into
  * *old_sp_slot, load SP from *new_sp_slot, restore registers, return.

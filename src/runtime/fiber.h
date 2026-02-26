@@ -95,7 +95,7 @@ int check_fiber_guard_page(os_vm_address_t addr);
 
 /* Assembly routines */
 #if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_ARM)
-extern void fiber_switch(void* old_sp_slot, void* new_sp_slot);
+extern void fiber_switch(void* old_sp_slot, void* new_sp_slot, void* thread_ptr);
 extern void fiber_entry_trampoline(void);
 #endif
 

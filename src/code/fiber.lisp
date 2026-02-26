@@ -35,8 +35,9 @@
 
 (define-alien-routine "fiber_switch"
     void
-  (old-rsp-slot system-area-pointer)
-  (new-rsp-slot system-area-pointer))
+  (old-rsp-slot unsigned-long)
+  (new-rsp-slot unsigned-long)
+  (thread-ptr unsigned-long))
 
 (define-alien-routine "enter_fiber_gc_context"
     void
@@ -62,6 +63,84 @@
             (:constructor make-fiber-wait-info (fd direction)))
   (fd -1 :type fixnum)
   (direction :input :type (member :input :output)))
+
+;;;; ===== Work-Stealing Deque (Chase-Lev) =====
+;;;
+;;; Each carrier owns a deque: push/pop from the bottom (LIFO, good locality),
+;;; thieves steal from the top (FIFO, breadth-first).  Lock-free via CAS on
+;;; the top index.  Buffer is a circular power-of-2 array that grows as needed.
+;;;
+;;; top and bottom are typed T (holding fixnums) so that COMPARE-AND-SWAP
+;;; works on them via the standard SBCL CAS infrastructure.
+
+(defstruct (work-stealing-deque (:constructor %make-wsd)
+                                (:conc-name wsd-))
+  (buffer (make-array 64 :initial-element nil) :type simple-vector)
+  (bottom 0 :type t)
+  (top 0 :type t))
+
+(defun wsd-grow (deque)
+  "Double the buffer size, copying existing entries."
+  (let* ((old-buf (wsd-buffer deque))
+         (old-size (length old-buf))
+         (new-size (* old-size 2))
+         (new-buf (make-array new-size :initial-element nil))
+         (top (the fixnum (wsd-top deque)))
+         (bottom (the fixnum (wsd-bottom deque)))
+         (old-mask (1- old-size))
+         (new-mask (1- new-size)))
+    (loop for i from top below bottom
+          do (setf (svref new-buf (logand i new-mask))
+                   (svref old-buf (logand i old-mask))))
+    (setf (wsd-buffer deque) new-buf)))
+
+(defun wsd-push (deque fiber)
+  "Owner pushes FIBER to the bottom of DEQUE."
+  (let* ((b (the fixnum (wsd-bottom deque)))
+         (t-val (the fixnum (wsd-top deque)))
+         (buf (wsd-buffer deque))
+         (size (length buf)))
+    ;; Grow if full
+    (when (>= (- b t-val) size)
+      (wsd-grow deque)
+      (setf buf (wsd-buffer deque)))
+    (setf (svref buf (logand b (1- (length buf)))) fiber)
+    (sb-thread:barrier (:write))
+    (setf (wsd-bottom deque) (1+ b))))
+
+(defun wsd-pop (deque)
+  "Owner pops from the bottom of DEQUE. Returns NIL if empty."
+  (let* ((b (1- (the fixnum (wsd-bottom deque)))))
+    (setf (wsd-bottom deque) b)
+    (sb-thread:barrier (:memory))
+    (let ((t-val (the fixnum (wsd-top deque))))
+      (cond
+        ((> b t-val)
+         ;; More than one element; safe to take
+         (svref (wsd-buffer deque) (logand b (1- (length (wsd-buffer deque))))))
+        ((= b t-val)
+         ;; Last element; race with stealers
+         (let ((item (svref (wsd-buffer deque) (logand b (1- (length (wsd-buffer deque)))))))
+           (if (eq (sb-ext:cas (wsd-top deque) t-val (1+ t-val)) t-val)
+               (progn (setf (wsd-bottom deque) (1+ t-val)) item)
+               (progn (setf (wsd-bottom deque) (1+ t-val)) nil))))
+        (t
+         ;; Empty
+         (setf (wsd-bottom deque) t-val)
+         nil)))))
+
+(defun wsd-steal (deque)
+  "Thief steals from the top of DEQUE. Returns NIL if empty or contention."
+  (let ((t-val (the fixnum (wsd-top deque))))
+    (sb-thread:barrier (:read))
+    (let ((b (the fixnum (wsd-bottom deque))))
+      (if (< t-val b)
+          (let ((item (svref (wsd-buffer deque)
+                             (logand t-val (1- (length (wsd-buffer deque)))))))
+            (if (eq (sb-ext:cas (wsd-top deque) t-val (1+ t-val)) t-val)
+                item
+                nil))
+          nil))))
 
 ;;;; ===== Fiber struct =====
 
@@ -102,15 +181,25 @@
   (c-control-stack (int-sap 0) :type system-area-pointer)
   (c-binding-stack (int-sap 0) :type system-area-pointer))
 
+;;;; ===== Fiber Scheduler Group (multi-carrier work-stealing) =====
+
+(defstruct (fiber-scheduler-group (:constructor %make-fiber-scheduler-group)
+                                   (:conc-name fsg-))
+  ;; Vector of all schedulers in this group
+  (schedulers #() :type simple-vector)
+  ;; Total active (non-dead) fibers across all carriers.
+  ;; Typed T (holds fixnum) so CAS works for atomic decrement.
+  (active-count 0 :type t))
+
 ;;;; ===== Fiber Scheduler struct =====
 
 (defstruct (fiber-scheduler (:constructor %make-fiber-scheduler))
-  (carrier nil)
-  (run-queue nil :type list)
-  (waiting nil :type list)
-  (current-fiber nil :type (or null fiber))
+  (carrier nil)                                       ; slot 0
+  (run-deque nil :type t)                             ; slot 1 (was run-queue)
+  (waiting nil :type list)                            ; slot 2
+  (current-fiber nil :type (or null fiber))           ; slot 3
   ;; Saved RSP for the scheduler's own stack frame (carrier thread stack)
-  (saved-rsp 0 :type sb-vm:word)
+  (saved-rsp 0 :type sb-vm:word)                     ; slot 4 — MUST stay here
   ;; Carrier's binding-stack-pointer, saved when a fiber is mounted
   (carrier-bsp 0 :type sb-vm:word)
   ;; Carrier's catch/unwind-protect block pointers
@@ -121,7 +210,11 @@
   ;; Event multiplexer fd: epoll (Linux), kqueue (BSD), -1 = unavailable
   (event-fd -1 :type fixnum)
   ;; Hash table of fd -> registered-events-mask (for epoll ctl tracking)
-  (registered-fds nil :type (or null hash-table)))
+  (registered-fds nil :type (or null hash-table))
+  ;; Work-stealing group (multi-carrier only)
+  (group nil :type (or null fiber-scheduler-group))
+  ;; Index of this scheduler in the group's schedulers vector
+  (index 0 :type fixnum))
 
 ;;;; ===== Per-thread scheduler =====
 ;;;
@@ -159,36 +252,35 @@
 ;;;; ===== Address helpers for fiber_switch =====
 ;;;
 ;;; fiber_switch needs pointers to the saved-rsp slots.
-;;; These return SAPs pointing to the raw word slot in the struct.
+;;; These return raw addresses (unsigned integers) of the saved-rsp slot.
+;;; They do NOT allocate SAP objects, which is critical because SAP allocation
+;;; can trigger GC and move the struct, invalidating the address.
 
-(defun fiber-saved-rsp-sap (fiber)
-  "Return a SAP pointing to the saved-rsp slot of FIBER."
-  ;; The saved-rsp slot is an sb-vm:word slot in the defstruct.
-  ;; We need the address of that slot in memory.
-  ;; Use the primitive instance slot accessor.
-  (sb-sys:int-sap
-   (+ (sb-kernel:get-lisp-obj-address fiber)
-      (- sb-vm:instance-pointer-lowtag)
-      (* (+ 1 ; header word
-            sb-vm:instance-data-start
-            ;; slot index of saved-rsp in the fiber struct
-            ;; We count: name=0, state=1, control-stack-start=2,
-            ;;           control-stack-end=3, control-stack-size=4,
-            ;;           saved-rsp=5
-            5)
-         sb-vm:n-word-bytes))))
+(defun fiber-saved-rsp-addr (fiber)
+  "Return the raw address of the saved-rsp slot of FIBER.
+Returns an unsigned integer (no SAP allocation)."
+  (+ (sb-kernel:get-lisp-obj-address fiber)
+     (- sb-vm:instance-pointer-lowtag)
+     (* (+ 1 ; header word
+           sb-vm:instance-data-start
+           ;; slot index of saved-rsp in the fiber struct
+           ;; We count: name=0, state=1, control-stack-start=2,
+           ;;           control-stack-end=3, control-stack-size=4,
+           ;;           saved-rsp=5
+           5)
+        sb-vm:n-word-bytes)))
 
-(defun scheduler-saved-rsp-sap (scheduler)
-  "Return a SAP pointing to the saved-rsp slot of SCHEDULER."
-  (sb-sys:int-sap
-   (+ (sb-kernel:get-lisp-obj-address scheduler)
-      (- sb-vm:instance-pointer-lowtag)
-      (* (+ 1 ; header word
-            sb-vm:instance-data-start
-            ;; slot index: carrier=0, run-queue=1, waiting=2,
-            ;;             current-fiber=3, saved-rsp=4
-            4)
-         sb-vm:n-word-bytes))))
+(defun scheduler-saved-rsp-addr (scheduler)
+  "Return the raw address of the saved-rsp slot of SCHEDULER.
+Returns an unsigned integer (no SAP allocation)."
+  (+ (sb-kernel:get-lisp-obj-address scheduler)
+     (- sb-vm:instance-pointer-lowtag)
+     (* (+ 1 ; header word
+           sb-vm:instance-data-start
+           ;; slot index: carrier=0, run-deque=1, waiting=2,
+           ;;             current-fiber=3, saved-rsp=4
+           4)
+        sb-vm:n-word-bytes)))
 
 ;;;; ===== Stack initialization =====
 
@@ -495,18 +587,31 @@ ready to be resumed."
     (sb-sys:without-interrupts
       (let* ((thread-sap (current-thread-sap))
              (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
+                              sb-vm:word-shift))
+             (catch-offset (ash sb-vm::thread-current-catch-block-slot
+                                sb-vm:word-shift))
+             (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
                               sb-vm:word-shift)))
         ;; 1. Save current BSP as fiber's binding-stack-pointer
         (setf (fiber-binding-stack-pointer fiber)
               (sb-sys:sap-ref-word thread-sap bsp-offset))
+        ;; 1b. Save fiber's catch/UWP blocks
+        (setf (fiber-saved-catch-block fiber)
+              (sb-sys:sap-ref-word thread-sap catch-offset))
+        (setf (fiber-saved-unwind-protect-block fiber)
+              (sb-sys:sap-ref-word thread-sap uwp-offset))
         ;; 2. Save fiber's TLS values and restore carrier's TLS values.
         ;;    This does NOT call unbind_to_here (which would zero entries).
         ;;    Instead it directly swaps TLS slot values using the binding
         ;;    stack entries' old_values as the carrier's original state.
         (save-fiber-tls-and-restore-carrier fiber)
-        ;; 3. Restore carrier's BSP
+        ;; 3. Restore carrier's BSP and catch/UWP blocks
         (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
               (fiber-scheduler-carrier-bsp sched))
+        (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+              (fiber-scheduler-carrier-catch-block sched))
+        (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+              (fiber-scheduler-carrier-unwind-protect-block sched))
         ;; 4. Set fiber state and wake condition
         (setf (fiber-state fiber) :suspended
               (fiber-wake-condition fiber) wake-condition)
@@ -514,8 +619,9 @@ ready to be resumed."
         ;;    NOTE: GC registration happens in resume-fiber-internal step 8,
         ;;    AFTER fiber_switch returns, when saved-rsp has the correct value.
         ;;    We must NOT register here because fiber_switch hasn't saved RSP yet.
-        (fiber-switch (fiber-saved-rsp-sap fiber)
-                      (scheduler-saved-rsp-sap sched))
+        (fiber-switch (fiber-saved-rsp-addr fiber)
+                      (scheduler-saved-rsp-addr sched)
+                      0)
         ;; Returns here when fiber is resumed
         ))))
 
@@ -567,6 +673,10 @@ ready to be resumed."
     (let* ((thread-sap (current-thread-sap))
            (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
                             sb-vm:word-shift))
+           (catch-offset (ash sb-vm::thread-current-catch-block-slot
+                              sb-vm:word-shift))
+           (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
+                            sb-vm:word-shift))
            (carrier-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
            (carrier-stack-start
              (sb-sys:sap-ref-word thread-sap
@@ -577,8 +687,12 @@ ready to be resumed."
            (carrier-bs-start
              (sb-sys:sap-ref-word thread-sap
                (ash sb-vm::thread-binding-stack-start-slot sb-vm:word-shift))))
-      ;; 1. Save carrier's BSP
+      ;; 1. Save carrier's BSP, catch block, and UWP block
       (setf (fiber-scheduler-carrier-bsp scheduler) carrier-bsp)
+      (setf (fiber-scheduler-carrier-catch-block scheduler)
+            (sb-sys:sap-ref-word thread-sap catch-offset))
+      (setf (fiber-scheduler-carrier-unwind-protect-block scheduler)
+            (sb-sys:sap-ref-word thread-sap uwp-offset))
       ;; 2. Register GC context FIRST: tell GC about the fiber's stack
       ;;    boundaries and register the carrier's suspended stack for
       ;;    scanning.  This must happen BEFORE changing BSP so that if
@@ -593,6 +707,12 @@ ready to be resumed."
       ;; 3. Set thread BSP to fiber's binding-stack-pointer
       (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
             (fiber-binding-stack-pointer fiber))
+      ;; 3b. Restore fiber's catch/UWP blocks
+      ;;     (0 for new fibers, saved values for suspended fibers)
+      (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+            (fiber-saved-catch-block fiber))
+      (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+            (fiber-saved-unwind-protect-block fiber))
       ;; 4. Replay fiber's TLS overlay
       (restore-fiber-tls-overlay fiber)
       ;; 5. Unregister fiber from GC (it's now running on carrier)
@@ -602,21 +722,36 @@ ready to be resumed."
             (old-sched *current-scheduler*))
         (setf *current-fiber* fiber
               *current-scheduler* scheduler)
-        ;; 7. Context switch to fiber
-        (fiber-switch (scheduler-saved-rsp-sap scheduler)
-                      (fiber-saved-rsp-sap fiber))
+        ;; 7. Context switch to fiber.
+        ;;    Pass the current thread pointer as 3rd arg so that
+        ;;    fiber_switch sets r13 after restoring registers.
+        ;;    On x86-64 without :gs-seg, r13 holds the thread pointer;
+        ;;    when a fiber migrates between carriers, the saved r13
+        ;;    would point to the old carrier's thread struct.
+        (fiber-switch (scheduler-saved-rsp-addr scheduler)
+                      (fiber-saved-rsp-addr fiber)
+                      (sb-sys:sap-int thread-sap))
         ;; Returns here when fiber yields or dies
         (setf *current-fiber* old-fiber
               *current-scheduler* old-sched))
-      ;; 8. Leave fiber GC context (unregister carrier's stack)
+      ;; 8. Re-register fiber for GC if it suspended (not dead).
+      ;;    This MUST happen BEFORE leave-fiber-gc-context to avoid a
+      ;;    window where the fiber's stack is not covered by any GC
+      ;;    scanning mechanism (neither the active context nor the
+      ;;    gc_info list).  With the active context still in place,
+      ;;    GC can scan the fiber's stack until the gc_info registration
+      ;;    takes over.
+      (unless (eq (fiber-state fiber) :dead)
+        (register-fiber-for-gc-from-fiber fiber))
+      ;; 9. Leave fiber GC context (unregister carrier's stack)
       (leave-fiber-gc-context)
-      ;; 9. Restore carrier's BSP (fiber's yield already did this,
-      ;;    but be safe)
+      ;; 10. Restore carrier's BSP and catch/UWP blocks
       (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
             (fiber-scheduler-carrier-bsp scheduler))
-      ;; 10. Re-register fiber for GC if it suspended (not dead)
-      (unless (eq (fiber-state fiber) :dead)
-        (register-fiber-for-gc-from-fiber fiber)))))
+      (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+            (fiber-scheduler-carrier-catch-block scheduler))
+      (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+            (fiber-scheduler-carrier-unwind-protect-block scheduler)))))
 
 ;;;; ===== Fiber trampoline (called from C) =====
 
@@ -625,47 +760,56 @@ ready to be resumed."
 the registered Lisp trampoline. Runs the fiber's function with
 error handling, marks it dead, cleans up bindings, and switches
 back to the scheduler."
-  (let ((scheduler (fiber-scheduler fiber)))
-    (unwind-protect
-         (handler-case
-             (let ((fn (fiber-function fiber)))
-               (when fn
-                 (setf (fiber-result fiber) (funcall fn))))
-           (error (c)
-             (setf (fiber-result fiber) c)))
-      ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
-      ;; By this point, normal Lisp unbinding (let exits, handler-case
-      ;; cleanup) has already undone the fiber's bindings and restored
-      ;; TLS values.  BSP should be at bs_start.  But as a safety
-      ;; measure, handle any remaining entries.
-      (setf (fiber-state fiber) :dead)
-      (let* ((thread-sap (current-thread-sap))
-             (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
+  (unwind-protect
+       (handler-case
+           (let ((fn (fiber-function fiber)))
+             (when fn
+               (setf (fiber-result fiber) (funcall fn))))
+         (error (c)
+           (setf (fiber-result fiber) c)))
+    ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
+    ;; IMPORTANT: Re-read the scheduler from the fiber struct, NOT from
+    ;; a captured variable.  The fiber may have migrated between carriers
+    ;; (via work-stealing), so the scheduler at creation time may differ
+    ;; from the current one.
+    (setf (fiber-state fiber) :dead)
+    (let* ((scheduler (fiber-scheduler fiber))
+           (thread-sap (current-thread-sap))
+           (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
+                            sb-vm:word-shift))
+           (catch-offset (ash sb-vm::thread-current-catch-block-slot
                               sb-vm:word-shift))
-             (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
-             (bs-start (fiber-binding-stack-start fiber)))
-        ;; If there are remaining binding stack entries, restore carrier
-        ;; TLS values from outermost old_values (same approach as yield)
-        (when (> current-bsp bs-start)
-          (let ((bsp-sap (sb-sys:int-sap current-bsp))
-                (start-sap (sb-sys:int-sap bs-start))
-                (seen nil))
-            (let ((ptr start-sap))
-              (loop while (sb-sys:sap< ptr bsp-sap)
-                    do (let ((old-value (sb-sys:sap-ref-word ptr 0))
-                             (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
-                         (when (and (plusp tls-index)
-                                    (not (member tls-index seen)))
-                           (push tls-index seen)
-                           (setf (sb-sys:sap-ref-word thread-sap tls-index)
-                                 old-value)))
-                    (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
-        ;; Restore carrier's BSP
-        (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
-              (fiber-scheduler-carrier-bsp scheduler)))
+           (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
+                            sb-vm:word-shift))
+           (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
+           (bs-start (fiber-binding-stack-start fiber)))
+      ;; If there are remaining binding stack entries, restore carrier
+      ;; TLS values from outermost old_values (same approach as yield)
+      (when (> current-bsp bs-start)
+        (let ((bsp-sap (sb-sys:int-sap current-bsp))
+              (start-sap (sb-sys:int-sap bs-start))
+              (seen nil))
+          (let ((ptr start-sap))
+            (loop while (sb-sys:sap< ptr bsp-sap)
+                  do (let ((old-value (sb-sys:sap-ref-word ptr 0))
+                           (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
+                       (when (and (plusp tls-index)
+                                  (not (member tls-index seen)))
+                         (push tls-index seen)
+                         (setf (sb-sys:sap-ref-word thread-sap tls-index)
+                               old-value)))
+                  (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
+      ;; Restore carrier's BSP and catch/UWP blocks
+      (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
+            (fiber-scheduler-carrier-bsp scheduler))
+      (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+            (fiber-scheduler-carrier-catch-block scheduler))
+      (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+            (fiber-scheduler-carrier-unwind-protect-block scheduler))
       ;; Switch back to scheduler
-      (fiber-switch (fiber-saved-rsp-sap fiber)
-                    (scheduler-saved-rsp-sap scheduler))
+      (fiber-switch (fiber-saved-rsp-addr fiber)
+                    (scheduler-saved-rsp-addr scheduler)
+                    0)
       ;; Should not reach here
       (error "fiber-trampoline: fiber_switch returned (unreachable)"))))
 
@@ -685,6 +829,7 @@ back to the scheduler."
   "Create a new fiber scheduler for the current thread."
   (let ((sched (%make-fiber-scheduler
                 :carrier *current-thread*
+                :run-deque (%make-wsd)
                 :idle-hook idle-hook)))
     ;; Try to create platform-optimal event multiplexer
     #+(or linux bsd)
@@ -699,7 +844,22 @@ back to the scheduler."
   "Submit a fiber to a scheduler for execution."
   (setf (fiber-scheduler fiber) scheduler
         (fiber-state fiber) :runnable)
-  (push fiber (fiber-scheduler-run-queue scheduler)))
+  (wsd-push (fiber-scheduler-run-deque scheduler) fiber))
+
+(defun try-steal-fiber (scheduler)
+  "Try to steal a fiber from a sibling scheduler in the group.
+Returns the stolen fiber, or NIL."
+  (let ((group (fiber-scheduler-group scheduler)))
+    (when group
+      (let* ((schedulers (fsg-schedulers group))
+             (n (length schedulers))
+             (start (random n)))
+        (loop for i from 0 below n
+              for idx = (mod (+ start i) n)
+              for victim = (aref schedulers idx)
+              unless (eq victim scheduler)
+              do (let ((stolen (wsd-steal (fiber-scheduler-run-deque victim))))
+                   (when stolen (return stolen))))))))
 
 (defun run-fiber-scheduler (scheduler)
   "Run the scheduler loop on the current thread. Returns when all
@@ -708,7 +868,9 @@ fibers have completed."
   ;; Install the C trampoline if not done yet
   (install-fiber-trampoline)
   (let ((*current-scheduler* scheduler)
-        (*current-fiber* nil))
+        (*current-fiber* nil)
+        (deque (fiber-scheduler-run-deque scheduler))
+        (group (fiber-scheduler-group scheduler)))
     (unwind-protect
          (loop
            ;; Check waiting fibers for wake conditions
@@ -719,14 +881,17 @@ fibers have completed."
                    (progn
                      (setf (fiber-state f) :runnable
                            (fiber-wake-condition f) nil)
-                     (setf (fiber-scheduler-run-queue scheduler)
-                           (nconc (fiber-scheduler-run-queue scheduler) (list f))))
+                     (wsd-push deque f))
                    (push f still-waiting)))
              (setf (fiber-scheduler-waiting scheduler) (nreverse still-waiting)))
-           ;; Pick next fiber
-           (let ((fiber (pop (fiber-scheduler-run-queue scheduler))))
+           ;; Pick next fiber: local pop, then try stealing
+           (let ((fiber (or (wsd-pop deque)
+                            (try-steal-fiber scheduler))))
              (cond
                (fiber
+                ;; Update scheduler back-pointer and carrier
+                (setf (fiber-scheduler fiber) scheduler
+                      (fiber-carrier fiber) *current-thread*)
                 (setf (fiber-scheduler-current-fiber scheduler) fiber)
                 (ecase (fiber-state fiber)
                   (:created  (start-fiber scheduler fiber))
@@ -736,14 +901,19 @@ fibers have completed."
                 ;; Handle post-switch state
                 (case (fiber-state fiber)
                   (:suspended
-                   ;; Move to waiting list if has wake condition, else back to run queue
+                   ;; Move to waiting list if has wake condition, else back to deque
                    (if (fiber-wake-condition fiber)
                        (push fiber (fiber-scheduler-waiting scheduler))
                        (progn
                          (setf (fiber-state fiber) :runnable)
-                         (setf (fiber-scheduler-run-queue scheduler)
-                               (nconc (fiber-scheduler-run-queue scheduler) (list fiber))))))
+                         (wsd-push deque fiber))))
                   (:dead
+                   ;; Decrement group active count (CAS loop)
+                   (when group
+                     (loop for old = (fsg-active-count group)
+                           until (eq (sb-ext:cas (fsg-active-count group)
+                                                 old (1- old))
+                                     old)))
                    ;; Clean up dead fiber resources
                    (destroy-fiber fiber))))
                ;; No runnable fibers but some waiting
@@ -752,7 +922,14 @@ fibers have completed."
                   (if hook
                       (funcall hook scheduler)
                       (fiber-io-idle-hook scheduler))))
-               ;; All fibers done
+               ;; No local work and no waiting; check group
+               (group
+                (if (plusp (the fixnum (fsg-active-count group)))
+                    ;; Other carriers still have active fibers; brief yield then retry
+                    (sb-unix:nanosleep 0 100000)  ; 100us
+                    ;; All fibers globally done
+                    (return)))
+               ;; Single-carrier mode: all done
                (t (return)))))
       ;; Cleanup: close event multiplexer fd
       #+(or linux bsd)
@@ -1071,27 +1248,35 @@ Called when no fibers are runnable but some are waiting."
 (defun run-fibers (fibers &key (carrier-count 1) idle-hook)
   "Run FIBERS across CARRIER-COUNT carrier threads.  Returns a list of
 fiber results when all fibers have completed.
-When CARRIER-COUNT is 1, runs on the current thread.
-When > 1, spawns CARRIER-COUNT-1 worker threads and runs one scheduler
-on the current thread."
+When CARRIER-COUNT is 1, runs on the current thread (no group overhead).
+When > 1, creates a work-stealing group and spawns CARRIER-COUNT-1 worker
+threads.  Idle carriers steal runnable fibers from busy carriers."
   (let ((fibers (coerce fibers 'list)))
     (when (null fibers) (return-from run-fibers nil))
     (if (<= carrier-count 1)
-        ;; Single-carrier: run on current thread (same as before)
+        ;; Single-carrier: run on current thread (no group needed)
         (let ((sched (make-fiber-scheduler :idle-hook idle-hook)))
           (dolist (f fibers)
             (submit-fiber sched f))
           (run-fiber-scheduler sched)
           (mapcar #'fiber-result fibers))
-        ;; Multi-carrier: distribute fibers round-robin across N schedulers
-        (let ((schedulers (loop repeat carrier-count
-                                collect (make-fiber-scheduler :idle-hook idle-hook)))
-              (threads nil))
+        ;; Multi-carrier with work-stealing
+        (let* ((schedulers (loop repeat carrier-count
+                                 collect (make-fiber-scheduler :idle-hook idle-hook)))
+               (sched-vec (coerce schedulers 'simple-vector))
+               (group (%make-fiber-scheduler-group
+                       :schedulers sched-vec
+                       :active-count (length fibers)))
+               (threads nil))
+          ;; Link schedulers to group
+          (loop for s across sched-vec
+                for i from 0
+                do (setf (fiber-scheduler-group s) group
+                         (fiber-scheduler-index s) i))
           ;; Distribute fibers round-robin
           (loop for f in fibers
                 for i from 0
-                for sched = (nth (mod i carrier-count) schedulers)
-                do (submit-fiber sched f))
+                do (submit-fiber (aref sched-vec (mod i carrier-count)) f))
           ;; Spawn N-1 worker threads for schedulers 1..N-1
           (dolist (sched (rest schedulers))
             (push (make-thread (lambda () (run-fiber-scheduler sched))

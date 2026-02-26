@@ -1723,5 +1723,11 @@
   (let ((b (& (>> val 7) #x7)))
    (let ((a (>> (<< val 5) 29)))
     (^ a (aref tab b))))))")
+(#(1212AE ED2334E 1FD47930 281AA720 42769E22 42D83FFB 47A71B28 4E8BB4F4 8967B623 8A4C1DAA 9BE41A37 A51AF5BC BF58A187 F7DD4013)
+ "(:ALLOW-OTHER-KEYS :INDEX :GROUP :REGISTERED-FDS :EVENT-FD :IDLE-HOOK :CARRIER-UNWIND-PROTECT-BLOCK :CARRIER-CATCH-BLOCK :CARRIER-BSP :SAVED-RSP :CURRENT-FIBER :WAITING :RUN-DEQUE :CARRIER)"
+ "((let ((tab #a((8) (unsigned-byte 8) 0 12 2 0 0 4 14 14)))
+  (let ((b (& (>> val 3) #x7)))
+   (let ((a (>> (<< val 5) 29)))
+    (^ a (aref tab b))))))")
 )
 ;; EOF

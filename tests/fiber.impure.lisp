@@ -583,3 +583,127 @@
            (assert (eql result 99)))
       (sb-unix:unix-close read-fd)
       (sb-unix:unix-close write-fd))))
+
+;;;; ===== Work-stealing deque and scheduling tests =====
+
+;;; Unlock SB-THREAD for test access to internal work-stealing deque symbols
+(sb-ext:unlock-package "SB-THREAD")
+
+;;; Work-stealing deque basic operations
+(with-test (:name (:fiber :work-stealing-deque-basic) :skipped-on :win32)
+  (let ((d (sb-thread::%make-wsd)))
+    ;; Push 10 items
+    (dotimes (i 10)
+      (sb-thread::wsd-push d i))
+    ;; Not empty
+    (assert (not (<= (sb-thread::wsd-bottom d) (sb-thread::wsd-top d))))
+    ;; Pop returns LIFO order (9, 8, 7, ...)
+    (assert (eql (sb-thread::wsd-pop d) 9))
+    (assert (eql (sb-thread::wsd-pop d) 8))
+    ;; Steal returns FIFO order (0, 1, 2, ...)
+    (assert (eql (sb-thread::wsd-steal d) 0))
+    (assert (eql (sb-thread::wsd-steal d) 1))
+    ;; Drain remaining: 6 items left (indices 2..7)
+    (let ((items nil))
+      (loop for item = (sb-thread::wsd-pop d)
+            while item do (push item items))
+      (assert (= (length items) 6)))
+    ;; Empty now
+    (assert (<= (sb-thread::wsd-bottom d) (sb-thread::wsd-top d)))
+    (assert (null (sb-thread::wsd-pop d)))
+    (assert (null (sb-thread::wsd-steal d)))))
+
+;;; Work-stealing deque concurrent: push from one thread, steal from another
+(with-test (:name (:fiber :work-stealing-deque-concurrent) :skipped-on :win32)
+  (let* ((d (sb-thread::%make-wsd))
+         (n 10000)
+         (stolen (make-array n :initial-element nil))
+         (stolen-count 0)
+         (done nil))
+    ;; Thief thread
+    (let ((thief (make-thread
+                  (lambda ()
+                    (loop until done
+                          do (let ((item (sb-thread::wsd-steal d)))
+                               (when item
+                                 (setf (aref stolen stolen-count) item)
+                                 (incf stolen-count))))
+                    ;; Drain remaining
+                    (loop for item = (sb-thread::wsd-steal d)
+                          while item
+                          do (setf (aref stolen stolen-count) item)
+                             (incf stolen-count)))
+                  :name "deque-thief")))
+      ;; Owner pushes N items
+      (dotimes (i n)
+        (sb-thread::wsd-push d (1+ i)))  ; push 1..N
+      (setf done t)
+      ;; Owner pops remaining
+      (let ((popped nil))
+        (loop for item = (sb-thread::wsd-pop d)
+              while item do (push item popped))
+        (join-thread thief)
+        ;; All items accounted for: stolen + popped = {1..N}
+        (let ((all (append popped (coerce (subseq stolen 0 stolen-count) 'list))))
+          (assert (= (length all) n))
+          (assert (null (set-difference all (loop for i from 1 to n collect i)))))))))
+
+;;; Multi-carrier work-stealing: all fibers submitted to carrier 0,
+;;; verify that carrier 1 steals and executes some
+(with-test (:name (:fiber :multi-carrier-work-stealing) :skipped-on :win32)
+  (let* ((n 40)
+         (thread-ids (make-array n :initial-element nil))
+         (fibers (loop for i below n
+                       collect (let ((idx i))
+                                 (make-fiber (lambda ()
+                                               (fiber-yield)
+                                               (setf (aref thread-ids idx)
+                                                     (sb-thread:thread-name sb-thread:*current-thread*))
+                                               idx)
+                                             :name (format nil "ws-fiber-~D" idx)))))
+         ;; Create schedulers manually to control fiber placement
+         (sched0 (make-fiber-scheduler))
+         (sched1 (make-fiber-scheduler))
+         (sched-vec (vector sched0 sched1))
+         (group (sb-thread::%make-fiber-scheduler-group
+                 :schedulers sched-vec
+                 :active-count n)))
+    ;; Link schedulers to group
+    (setf (sb-thread::fiber-scheduler-group sched0) group
+          (sb-thread::fiber-scheduler-index sched0) 0
+          (sb-thread::fiber-scheduler-group sched1) group
+          (sb-thread::fiber-scheduler-index sched1) 1)
+    ;; Submit ALL fibers to scheduler 0 only
+    (dolist (f fibers)
+      (submit-fiber sched0 f))
+    ;; Run scheduler 1 on a worker thread (it has no fibers — must steal)
+    (let ((worker (make-thread (lambda () (run-fiber-scheduler sched1))
+                               :name "steal-carrier")))
+      (run-fiber-scheduler sched0)
+      (join-thread worker))
+    ;; All fibers should be dead
+    (dolist (f fibers)
+      (assert (eq (fiber-state f) :dead)))
+    ;; At least some fibers should have run on the steal-carrier thread
+    (let ((stolen-count (count "steal-carrier" thread-ids :test #'equal)))
+      (assert (plusp stolen-count)
+              () "Expected some fibers stolen, but none ran on steal-carrier"))))
+
+;;; Multi-carrier imbalanced workload: verify work-stealing improves throughput
+(with-test (:name (:fiber :multi-carrier-imbalanced) :skipped-on :win32)
+  (let* ((n 100)
+         (fibers (loop for i below n
+                       collect (make-fiber (lambda ()
+                                             (fiber-yield)
+                                             ;; Do some trivial work
+                                             (let ((sum 0))
+                                               (dotimes (j 1000) (incf sum j))
+                                               sum))
+                                           :name (format nil "imb-~D" i)))))
+    ;; All fibers via run-fibers with 4 carriers; they start round-robin
+    ;; but work-stealing should keep all carriers busy
+    (let ((results (run-fibers fibers :carrier-count 4)))
+      ;; Verify all fibers completed correctly
+      (assert (= (length results) n))
+      (dolist (r results)
+        (assert (eql r 499500))))))

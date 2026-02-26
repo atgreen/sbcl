@@ -19,16 +19,23 @@
 .text
 
 /*
- * fiber_switch(uint64_t* old_rsp_slot, uint64_t* new_rsp_slot)
+ * fiber_switch(uint64_t* old_rsp_slot, uint64_t* new_rsp_slot,
+ *              uint64_t thread_ptr)
  *
  * Saves callee-saved registers onto the current stack, stores RSP into
  * *old_rsp_slot, loads RSP from *new_rsp_slot, pops registers, and returns.
+ *
+ * thread_ptr (3rd arg): On x86-64 without gs-seg, r13 holds the thread
+ * pointer.  fiber_switch saves/restores r13, so when a fiber migrates
+ * between carriers, the restored r13 would point to the old carrier's
+ * thread struct.  If thread_ptr is non-zero, r13 is set to thread_ptr
+ * after restoring registers, ensuring the correct thread context.
  */
 
 #ifdef _WIN32
 /*
  * Windows x64 ABI:
- *   Arguments: rcx, rdx (not rdi, rsi)
+ *   Arguments: rcx, rdx, r8 (not rdi, rsi, rdx)
  *   Callee-saved: rbx, rbp, rdi, rsi, r12-r15
  *
  * Stack layout after saves (lowest address at top):
@@ -63,7 +70,11 @@ fiber_switch:
         popq    %rdi
         popq    %rbx
         popq    %rbp
-        ret
+        /* Patch thread register if thread_ptr (r8) is non-zero */
+        testq   %r8, %r8
+        jz      1f
+        movq    %r8, %r13
+1:      ret
 
 /*
  * fiber_entry_trampoline -- initial return target for a brand-new fiber.
@@ -84,7 +95,7 @@ fiber_entry_trampoline:
 
 /*
  * SysV x86-64 ABI:
- *   Arguments: rdi, rsi
+ *   Arguments: rdi, rsi, rdx
  *   Callee-saved: rbx, rbp, r12-r15
  *
  * Stack layout after saves (lowest address at top):
@@ -116,7 +127,11 @@ fiber_switch:
         popq    %r12
         popq    %rbx
         popq    %rbp
-        ret
+        /* Patch thread register if thread_ptr (rdx) is non-zero */
+        testq   %rdx, %rdx
+        jz      1f
+        movq    %rdx, %r13
+1:      ret
 .size fiber_switch, .-fiber_switch
 
 /*

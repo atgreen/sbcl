@@ -37,11 +37,17 @@
 .text
 
 /*
- * fiber_switch(void* old_sp_slot, void* new_sp_slot)
+ * fiber_switch(void* old_sp_slot, void* new_sp_slot, void* thread_ptr)
  *
  * AAPCS64 calling convention:
- *   Arguments: x0, x1
+ *   Arguments: x0, x1, x2
  *   Callee-saved: x19-x28, x29(FP), x30(LR), d8-d15
+ *
+ * thread_ptr (3rd arg): On ARM64 with sb-thread, x21 holds the thread
+ * pointer.  fiber_switch saves/restores x21, so when a fiber migrates
+ * between carriers, the restored x21 would point to the old carrier's
+ * thread struct.  If thread_ptr is non-zero, x21 is set to thread_ptr
+ * after restoring registers, ensuring the correct thread context.
  *
  * Save 20 callee-saved registers (160 bytes) onto the current stack,
  * store SP into *old_sp_slot, load SP from *new_sp_slot, restore
@@ -105,7 +111,10 @@ GNAME(fiber_switch):
         ldp     x19, x20, [sp, #16]
         ldp     x29, x30, [sp], #160
 
-        ret
+        /* Patch thread register if thread_ptr (x2) is non-zero */
+        cbz     x2, 1f
+        mov     x21, x2
+1:      ret
         SIZE(GNAME(fiber_switch))
 
 /*

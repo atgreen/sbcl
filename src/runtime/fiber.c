@@ -242,13 +242,21 @@ enter_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
     ctx->fiber_stack_end = (lispobj*)fiber_stack_end;
     ctx->fiber_binding_stack_start = (lispobj*)fiber_bs_start;
 
-    /* Register carrier's binding stack for GC scavenging.
-     * Set control_stack_pointer = control_stack_end so the control stack
-     * scan loop in gencgc.c sees an empty range (ptr < end is immediately
-     * false).  The carrier's control stack is scanned directly by the
-     * fiber-aware code in gencgc.c which skips the guard pages. */
+    /* Register carrier's stack for GC scanning.  The carrier will be
+     * suspended by fiber_switch somewhere below our current frame.
+     * We use __builtin_frame_address(0) minus a generous 16KB buffer
+     * as a conservative approximation of the carrier's eventual
+     * suspended RSP, ensuring all frames between here and the actual
+     * suspension point are included in the GC's conservative scan.
+     * Clamp above the guard pages (3 pages at bottom of stack). */
     ctx->carrier_gc_info.control_stack_base = (lispobj*)carrier_stack_start;
-    ctx->carrier_gc_info.control_stack_pointer = (lispobj*)carrier_stack_end;
+    {
+        uintptr_t approx_sp = (uintptr_t)__builtin_frame_address(0) - 16384;
+        uintptr_t stack_min = carrier_stack_start + 3 * os_vm_page_size;
+        if (approx_sp < stack_min)
+            approx_sp = stack_min;
+        ctx->carrier_gc_info.control_stack_pointer = (lispobj*)approx_sp;
+    }
     ctx->carrier_gc_info.control_stack_end = (lispobj*)carrier_stack_end;
     ctx->carrier_gc_info.binding_stack_start = (lispobj*)carrier_bs_start;
     ctx->carrier_gc_info.binding_stack_pointer = (lispobj*)carrier_bsp;
