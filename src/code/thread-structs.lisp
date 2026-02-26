@@ -51,6 +51,7 @@
   (name nil :type (or null string))
   ;; Generation counter for fiber-aware condition variables.
   ;; Incremented by CONDITION-NOTIFY; fiber waiters check for change.
+  #+sb-fiber
   (fiber-generation 0 :type sb-ext:word)
   ;; For WITH-CAS-LOCK: because CONDITION-WAIT must be able to call
   ;; %WAITQUEUE-WAKEUP without re-aquiring the mutex, we need a separate
@@ -218,5 +219,7 @@ temporarily.")
 
 ;; Fiber context variables (declared early so serve-event.lisp can check them;
 ;; fiber.lisp provides the actual implementation)
+#+sb-fiber
 (defvar *current-fiber* nil)
+#+sb-fiber
 (defvar *current-scheduler* nil)

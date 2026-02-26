@@ -220,6 +220,7 @@ up. Returns true once the FD is usable, NIL return indicates timeout.
 If SERVE-EVENTS is true (the default), events on other FDs are served while
 waiting."
   ;; Fiber dispatch: if inside a fiber, yield instead of blocking carrier
+  #+sb-fiber
   (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
     (let ((result (funcall 'sb-thread::%fiber-wait-until-fd-usable
                            fd direction timeout)))

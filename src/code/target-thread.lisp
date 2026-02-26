@@ -969,6 +969,7 @@ Notes:
   (or (%try-mutex mutex)
       #+sb-thread
       (when waitp
+        #+sb-fiber
         (when (and *current-fiber* *current-scheduler*)
           (let ((result (funcall '%fiber-grab-mutex mutex timeout)))
             (unless (eq result :pinned-fall-through)
@@ -981,6 +982,7 @@ Notes:
   ;; Always wait with infinite timeout, never examine the waiting-for graph.
   ;; This _does_ support *DEADLINE* hence the DECODE-TIMEOUT call.
   (or (%try-mutex mutex)
+      #+sb-fiber
       (when (and *current-fiber* *current-scheduler*)
         (let ((result (funcall '%fiber-grab-mutex mutex nil)))
           (unless (eq result :pinned-fall-through)
@@ -1101,7 +1103,7 @@ IF-NOT-OWNER is :FORCE)."
   ;; Fiber dispatch (before any interrupt/futex setup).
   ;; %fiber-condition-wait handles pin check internally; returns
   ;; :pinned-fall-through when the fiber is pinned and should block normally.
-  #+sb-thread
+  #+(and sb-thread sb-fiber)
   (when (and *current-fiber* *current-scheduler*)
     (let ((vals (multiple-value-list
                  (funcall '%fiber-condition-wait queue mutex timeout stop-sec stop-usec))))
@@ -1281,7 +1283,7 @@ must be held by this thread during this call."
   (declare (ignorable queue n))
   #-sb-thread (error "Not supported in unithread builds.")
   ;; Wake fiber waiters via generation counter (caller holds mutex, no race)
-  #+sb-thread
+  #+(and sb-thread sb-fiber)
   (incf (waitqueue-fiber-generation queue))
   #+sb-futex
   (progn

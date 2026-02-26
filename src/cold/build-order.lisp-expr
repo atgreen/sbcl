@@ -555,6 +555,7 @@
 
  ("src/code/avltree"           :c-headers)
  ("src/code/target-thread"     :not-host)
+ #+sb-fiber
  ("src/code/fiber"             :not-host)
 
  ("src/code/error-error" :not-host) ; needs WITH-STANDARD-IO-SYNTAX macro

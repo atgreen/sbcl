@@ -83,6 +83,7 @@
            ;; though I don't think they should all be public.
            :MSAN :UBSAN
            :SB-SAFEPOINT
+           :SB-FIBER
            :SB-THREAD :SB-UNICODE
            ;; Things which (I think) at least one person has requested be kept around
            :SB-LDB

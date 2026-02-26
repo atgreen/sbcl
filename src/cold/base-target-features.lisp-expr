@@ -190,6 +190,12 @@
  ;;
  ; :sb-futex
 
+ ;; Fiber (virtual thread / green thread) support.
+ ;; Cooperative lightweight threads that multiplex onto carrier OS
+ ;; threads via architecture-specific context-switch assembly.
+ ;; Available on x86-64, arm64, and arm.
+ ; :sb-fiber
+
  ;; Support for detection of unportable code (when applied to the
  ;; COMMON-LISP package, or SBCL-internal pacakges) or bad-neighbourly
  ;; code (when applied to user-level packages), relating to material
