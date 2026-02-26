@@ -2024,6 +2024,31 @@ forms that explicitly control this kind of evaluation.")
 (!def-debug-command "BACKTRACE" ()
  (print-backtrace :count (read-if-available most-positive-fixnum)))
 
+#+sb-fiber
+(!def-debug-command "FIBER" ()
+  (let* ((index (read-if-available nil))
+         (fibers (funcall 'sb-thread::list-all-fibers))
+         (fiber (if index
+                    (nth index fibers)
+                    (progn
+                      (format *debug-io* "~&Fibers:~%")
+                      (loop for f in fibers
+                            for i from 0
+                            do (format *debug-io* "  ~D: ~A~%" i f))
+                      (format *debug-io* "~&Select fiber: ")
+                      (force-output *debug-io*)
+                      (nth (read *debug-io*) fibers)))))
+    (when fiber
+      (unless (member (sb-thread::fiber-state fiber) '(:suspended :created))
+        (format *debug-io* "~&Can only inspect suspended/created fibers.~%")
+        (return-from fiber-debug-command))
+      (let ((frame (sb-di::fiber-top-frame fiber)))
+        (if frame
+            (progn
+              (setf *current-frame* frame)
+              (print-frame-call frame *debug-io*))
+            (format *debug-io* "~&Could not get fiber frame.~%"))))))
+
 (!def-debug-command "PRINT" ()
   (print-frame-call *current-frame* *debug-io*))
 

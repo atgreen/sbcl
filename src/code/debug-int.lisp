@@ -534,22 +534,30 @@
 (defconstant known-return-p-slot (+ code-constants-offset 1))
 (defconstant cookie-slot (+ code-constants-offset 2))
 
+;;; When set, control-stack-pointer-valid-p uses these instead of the
+;;; current thread's stack bounds.  Used by fiber-top-frame to allow
+;;; the debugger to walk a fiber's stack.
+(defvar *debug-control-stack-start* nil)
+(defvar *debug-control-stack-end* nil)
+
 (declaim (inline control-stack-pointer-valid-p))
 (defun control-stack-pointer-valid-p (x &optional (aligned t))
   (declare (type system-area-pointer x))
   (let* (#-stack-grows-downward-not-upward
          (control-stack-start
-          (descriptor-sap *control-stack-start*))
+          (or *debug-control-stack-start*
+              (descriptor-sap *control-stack-start*)))
          #+stack-grows-downward-not-upward
          (control-stack-end
-          (descriptor-sap *control-stack-end*)))
+          (or *debug-control-stack-end*
+              (descriptor-sap *control-stack-end*))))
     #-stack-grows-downward-not-upward
-    (and (sap< x (current-sp))
+    (and (or *debug-control-stack-start* (sap< x (current-sp)))
          (sap<= control-stack-start x)
          (or (not aligned) (zerop (logand (sap-int x)
                                           (1- (ash 1 word-shift))))))
     #+stack-grows-downward-not-upward
-    (and (sap>= x (current-sp))
+    (and (or *debug-control-stack-end* (sap>= x (current-sp)))
          (sap> control-stack-end x)
          (or (not aligned) (zerop (logand (sap-int x)
                                           (1- (ash 1 word-shift))))))))
@@ -4161,3 +4169,39 @@ register."
                 (flush-frames-above caller)
                 (return caller)))))
       ((or error debug-condition) ()))))
+
+;;;; ===== Fiber debug support =====
+
+#+sb-fiber
+(defun fiber-top-frame (fiber)
+  "Return the top debugger frame for a suspended fiber.
+Temporarily overrides the control-stack bounds so that
+compute-calling-frame accepts the fiber's stack range."
+  (let* ((saved-rsp (sb-thread::fiber-saved-rsp fiber))
+         ;; Extract FP and PC from the fiber-switch save area
+         ;; (architecture-specific offsets, same as fiber-get-backtrace)
+         (fp-val #+(and x86-64 (not win32))
+                 (sap-ref-word (int-sap saved-rsp) 40)
+                 #+(and x86-64 win32)
+                 (sap-ref-word (int-sap saved-rsp) 56)
+                 #+arm64
+                 (sap-ref-word (int-sap saved-rsp) 0)
+                 #+arm
+                 (sap-ref-32 (int-sap saved-rsp) 96)
+                 #+ppc64
+                 (sap-ref-word (int-sap saved-rsp) 32))
+         (pc-val #+(and x86-64 (not win32))
+                 (sap-ref-word (int-sap saved-rsp) 48)
+                 #+(and x86-64 win32)
+                 (sap-ref-word (int-sap saved-rsp) 64)
+                 #+arm64
+                 (sap-ref-word (int-sap saved-rsp) 8)
+                 #+arm
+                 (sap-ref-32 (int-sap saved-rsp) 100)
+                 #+ppc64
+                 (sap-ref-word (int-sap saved-rsp) 8))
+         (*debug-control-stack-start*
+          (int-sap (sb-thread::fiber-control-stack-start fiber)))
+         (*debug-control-stack-end*
+          (int-sap (sb-thread::fiber-control-stack-end fiber))))
+    (compute-calling-frame (int-sap fp-val) (int-sap pc-val) nil)))

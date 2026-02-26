@@ -211,6 +211,49 @@
   ;; Index of this scheduler in the group's schedulers vector
   (index 0 :type fixnum))
 
+;;;; ===== Portable TLS offset helpers =====
+;;;
+;;; On architectures with wired TLS slots (x86-64, arm64, riscv, loongarch64),
+;;; catch-block and unwind-protect-block have compile-time slot constants.
+;;; On others (PPC64), these are regular TLS variables accessed via
+;;; symbol-tls-index at runtime.
+
+(defun %catch-block-tls-offset ()
+  "Return the TLS byte offset for *current-catch-block*."
+  #+(or x86-64 (and (or arm64 riscv loongarch64) sb-thread))
+  (ash sb-vm::thread-current-catch-block-slot sb-vm:word-shift)
+  #-(or x86-64 (and (or arm64 riscv loongarch64) sb-thread))
+  (symbol-tls-index 'sb-vm::*current-catch-block*))
+
+(defun %uwp-block-tls-offset ()
+  "Return the TLS byte offset for *current-unwind-protect-block*."
+  #+(or x86-64 (and (or arm64 riscv loongarch64) sb-thread))
+  (ash sb-vm::thread-current-unwind-protect-block-slot sb-vm:word-shift)
+  #-(or x86-64 (and (or arm64 riscv loongarch64) sb-thread))
+  (symbol-tls-index 'sb-vm::*current-unwind-protect-block*))
+
+;;;; ===== Global Fiber Registry =====
+
+(defvar *all-fibers* nil)
+(defvar *all-fibers-lock* (sb-thread:make-mutex :name "all-fibers"))
+
+(defun list-all-fibers ()
+  "Return a list of all live fibers."
+  (sb-thread:with-mutex (*all-fibers-lock*)
+    (copy-list *all-fibers*)))
+
+;;;; ===== Fiber printing =====
+
+(defmethod print-object ((fiber fiber) stream)
+  (print-unreadable-object (fiber stream :type t :identity t)
+    (let ((name (fiber-name fiber))
+          (state (fiber-state fiber))
+          (carrier (fiber-carrier fiber)))
+      (when name (format stream "~S " name))
+      (format stream "~S" state)
+      (when (and carrier (eq state :running))
+        (format stream " on ~S" carrier)))))
+
 ;;;; ===== Per-thread scheduler =====
 ;;;
 ;;; *current-fiber* and *current-scheduler* are declared in thread-structs.lisp
@@ -517,12 +560,18 @@ MAKE-FIBER time."
       ;; before this fiber starts, the conservative scanner must see that
       ;; reference to pin the fiber object in place.
       (register-fiber-for-gc-from-fiber fiber)
+      ;; Register in global fiber list
+      (with-mutex (*all-fibers-lock*)
+        (push fiber *all-fibers*))
       fiber)))
 
 (defun destroy-fiber (fiber)
   "Free the resources associated with FIBER. Only call on dead fibers."
   (unless (eq (fiber-state fiber) :dead)
     (error "Cannot destroy a fiber that is not dead"))
+  ;; Remove from global fiber list
+  (with-mutex (*all-fibers-lock*)
+    (setf *all-fibers* (delete fiber *all-fibers* :count 1)))
   ;; Free GC info
   (let ((gc-info (fiber-gc-info fiber)))
     (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
@@ -626,10 +675,8 @@ ready to be resumed."
       (let* ((thread-sap (current-thread-sap))
              (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
                               sb-vm:word-shift))
-             (catch-offset (ash sb-vm::thread-current-catch-block-slot
-                                sb-vm:word-shift))
-             (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
-                              sb-vm:word-shift)))
+             (catch-offset (%catch-block-tls-offset))
+             (uwp-offset (%uwp-block-tls-offset)))
         ;; 1. Save current BSP as fiber's binding-stack-pointer
         (setf (fiber-binding-stack-pointer fiber)
               (sb-sys:sap-ref-word thread-sap bsp-offset))
@@ -711,10 +758,8 @@ ready to be resumed."
     (let* ((thread-sap (current-thread-sap))
            (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
                             sb-vm:word-shift))
-           (catch-offset (ash sb-vm::thread-current-catch-block-slot
-                              sb-vm:word-shift))
-           (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
-                            sb-vm:word-shift))
+           (catch-offset (%catch-block-tls-offset))
+           (uwp-offset (%uwp-block-tls-offset))
            (carrier-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
            (carrier-stack-start
              (sb-sys:sap-ref-word thread-sap
@@ -815,10 +860,8 @@ back to the scheduler."
            (thread-sap (current-thread-sap))
            (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
                             sb-vm:word-shift))
-           (catch-offset (ash sb-vm::thread-current-catch-block-slot
-                              sb-vm:word-shift))
-           (uwp-offset (ash sb-vm::thread-current-unwind-protect-block-slot
-                            sb-vm:word-shift))
+           (catch-offset (%catch-block-tls-offset))
+           (uwp-offset (%uwp-block-tls-offset))
            (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
            (bs-start (fiber-binding-stack-start fiber)))
       ;; If there are remaining binding stack entries, restore carrier
@@ -1344,6 +1387,65 @@ threads.  Idle carriers steal runnable fibers from busy carriers."
             (join-thread th))
           (mapcar #'fiber-result fibers)))))
 
+;;;; ===== Fiber Backtrace =====
+
+(defun fiber-get-backtrace (fiber)
+  "Return a backtrace list for a suspended fiber.
+Each element is either (CODE . OFFSET) for Lisp frames, or a raw PC
+for foreign frames.  Only works for :SUSPENDED or :CREATED fibers."
+  (unless (member (fiber-state fiber) '(:suspended :created))
+    (error "Can only get backtrace for suspended/created fibers, not ~S"
+           (fiber-state fiber)))
+  (let* ((saved-rsp (fiber-saved-rsp fiber))
+         (stack-start (fiber-control-stack-start fiber))
+         (stack-end (fiber-control-stack-end fiber))
+         ;; Extract FP and PC from the fiber-switch save area.
+         ;; The save area layout is architecture-specific:
+         ;;   x86-64 SysV: 6 pushed regs, FP(rbp) at +40, ret addr at +48
+         ;;   x86-64 Win64: 8 pushed regs, FP(rbp) at +56, ret addr at +64
+         ;;   ARM64: stp x29,x30 first, FP at +0, LR at +8
+         ;;   ARM32: r11 at +96, lr at +100
+         ;;   PPC64: backchain+0, LR at +8, r15(cfp) at +32
+         (fp #+(and x86-64 (not win32))
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 40)
+             #+(and x86-64 win32)
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 56)
+             #+arm64
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 0)
+             #+arm
+             (sb-sys:sap-ref-32 (sb-sys:int-sap saved-rsp) 96)
+             #+ppc64
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 32))
+         (pc #+(and x86-64 (not win32))
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 48)
+             #+(and x86-64 win32)
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 64)
+             #+arm64
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 8)
+             #+arm
+             (sb-sys:sap-ref-32 (sb-sys:int-sap saved-rsp) 100)
+             #+ppc64
+             (sb-sys:sap-ref-word (sb-sys:int-sap saved-rsp) 8))
+         (list))
+    ;; Walk the FP chain, collecting (code . offset) or raw PCs
+    (flet ((store-pc (pc)
+             (let ((code (sb-di::code-header-from-pc pc)))
+               (push (if code
+                         (cons code (- pc
+                                      (sb-sys:sap-int
+                                       (sb-kernel:code-instructions code))))
+                         pc)
+                     list))))
+      (store-pc pc)
+      (when (and (< stack-start fp stack-end) (> fp saved-rsp))
+        (loop
+         (let ((next-fp (sb-sys:sap-ref-word (sb-sys:int-sap fp) 0))
+               (next-pc (sb-sys:sap-ref-word (sb-sys:int-sap fp) 8)))
+           (store-pc next-pc)
+           (unless (and (> next-fp fp) (< next-fp stack-end)) (return))
+           (setq fp next-fp)))))
+    (nreverse list)))
+
 ;;;; ===== Exports =====
 
 (export '(make-fiber
@@ -1374,4 +1476,6 @@ threads.  Idle carriers steal runnable fibers from busy carriers."
           fiber-io-idle-hook
           fiber-wait-info
           fiber-wait-info-fd
-          fiber-wait-info-direction))
+          fiber-wait-info-direction
+          list-all-fibers
+          fiber-get-backtrace))

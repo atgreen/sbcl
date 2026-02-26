@@ -764,3 +764,56 @@
     ;; bound-fiber saw :fiber-value, unbound-fiber saw :default
     (assert (member :fiber-value results))
     (assert (member :default results))))
+
+;;;; ===== Fiber Enumeration and Debug =====
+
+(with-test (:name (:fiber :list-all-fibers) :skipped-on :win32)
+  ;; Clear any leftover fibers
+  (let ((before (list-all-fibers)))
+    (let* ((f1 (make-fiber (lambda () 42) :name "enum-1"))
+           (f2 (make-fiber (lambda () 43) :name "enum-2"))
+           (all-after (list-all-fibers)))
+      ;; Both fibers should be in the global list
+      (assert (member f1 all-after))
+      (assert (member f2 all-after))
+      (assert (>= (length all-after) (+ 2 (length before))))
+      ;; Run them so they die
+      (run-fibers (list f1 f2))
+      ;; After destroy (which run-fibers does), they should be gone
+      (let ((all-final (list-all-fibers)))
+        (assert (not (member f1 all-final)))
+        (assert (not (member f2 all-final)))))))
+
+(with-test (:name (:fiber :print-object) :skipped-on :win32)
+  (let* ((f (make-fiber (lambda () nil) :name "print-test"))
+         (str (princ-to-string f)))
+    ;; Should contain the fiber name and state
+    (assert (search "print-test" str))
+    (assert (search ":CREATED" str))
+    ;; Clean up
+    (run-fibers (list f))))
+
+(with-test (:name (:fiber :fiber-get-backtrace) :skipped-on :win32)
+  (let* ((backtrace-result nil)
+         (inspected nil)
+         (f1 (make-fiber
+              (lambda ()
+                ;; Yield to suspend so the inspector fiber can see our stack
+                (fiber-yield (lambda () inspected)))
+              :name "bt-target"))
+         (f2 (make-fiber
+              (lambda ()
+                ;; Yield first to let f1 run and suspend (deque is LIFO)
+                (fiber-yield (lambda ()
+                               (eq (sb-thread::fiber-state f1) :suspended)))
+                ;; f1 is now suspended — get its backtrace
+                (setf backtrace-result (fiber-get-backtrace f1))
+                ;; Wake f1 up
+                (setf inspected t))
+              :name "bt-inspector")))
+    (run-fibers (list f1 f2))
+    ;; The backtrace should be a non-empty list
+    (assert (consp backtrace-result))
+    ;; Each element should be either (code . offset) or a raw integer
+    (dolist (entry backtrace-result)
+      (assert (or (consp entry) (integerp entry))))))
