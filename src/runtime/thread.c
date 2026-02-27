@@ -723,6 +723,10 @@ static void attach_os_thread(init_thread_data *scribble)
 # endif
     th->control_stack_start = stack_addr;
     th->control_stack_end = (void *) (((uintptr_t) stack_addr) + stack_size);
+#ifdef LISP_FEATURE_SB_FIBER
+    th->effective_control_stack_start = stack_addr;
+    th->effective_control_stack_end = (void *) (((uintptr_t) stack_addr) + stack_size);
+#endif
 #endif
 
     /* We don't protect the control stack when adopting a foreign thread

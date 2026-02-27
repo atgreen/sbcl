@@ -802,6 +802,22 @@ information."
          (cond ((and (<= (get-lisp-obj-address sb-vm:*control-stack-start*) a)
                      (< a (get-lisp-obj-address sb-vm:*control-stack-end*)))
                 sb-thread:*current-thread*)
+               ;; When running in a fiber, RSP is in the fiber's mmap'd stack,
+               ;; not the carrier thread's control stack.  Check the
+               ;; per-thread effective stack bounds (set by fiber resume).
+               #+sb-fiber
+               ((let ((eff-start (sb-sys:sap-ref-word
+                                  (sb-thread::current-thread-sap)
+                                  (ash sb-vm::thread-effective-control-stack-start-slot
+                                       sb-vm:word-shift)))
+                      (eff-end (sb-sys:sap-ref-word
+                                (sb-thread::current-thread-sap)
+                                (ash sb-vm::thread-effective-control-stack-end-slot
+                                     sb-vm:word-shift))))
+                  (and (/= eff-start (get-lisp-obj-address sb-vm:*control-stack-start*))
+                       (<= eff-start a)
+                       (< a eff-end)))
+                sb-thread:*current-thread*)
                (all-threads
                 ;; There aren't many reasons to inquire whether a random object is on any stack.
                 ;; And if performance isn't important, this loop could be changed to

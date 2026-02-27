@@ -30,7 +30,9 @@
                        (make-sc+offset immediate-sc-number size)
                        size))))
     (inst sub rsp-tn size)
-    (inst cmp :qword rsp-tn (thread-slot-ea thread-control-stack-start-slot))
+    (inst cmp :qword rsp-tn
+          (thread-slot-ea #+sb-fiber thread-effective-control-stack-start-slot
+                          #-sb-fiber thread-control-stack-start-slot))
     ;; avoid clearing condition codes
     (inst lea rsp-tn (if (integerp size)
                          (ea size rsp-tn)

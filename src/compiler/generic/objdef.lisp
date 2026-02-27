@@ -534,6 +534,15 @@ during backtrace.
                        :special *control-stack-start*)
   (control-stack-end :c-type "lispobj *" :pointer t
                      :special *control-stack-end*)
+  ;; Effective stack bounds for fiber-aware code.
+  ;; Normally equal control-stack-start/end; set to a fiber's stack
+  ;; bounds when running on a fiber so that the stack-overflow-check
+  ;; VOP and stack-allocated-p use the correct range without disturbing
+  ;; the GC's use of control-stack-start/end.
+  #+sb-fiber
+  (effective-control-stack-start :c-type "lispobj *" :pointer t)
+  #+sb-fiber
+  (effective-control-stack-end :c-type "lispobj *" :pointer t)
   (this :c-type "struct thread *" :pointer t)
   (prev :c-type "struct thread *" :pointer t)
   (next :c-type "struct thread *" :pointer t)

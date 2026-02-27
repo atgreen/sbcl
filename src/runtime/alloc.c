@@ -660,6 +660,10 @@ alloc_thread_struct(void* spaces) {
     th->binding_stack_start=
         (lispobj*)((char*)th->control_stack_start+thread_control_stack_size);
     th->control_stack_end = th->binding_stack_start;
+#ifdef LISP_FEATURE_SB_FIBER
+    th->effective_control_stack_start = th->control_stack_start;
+    th->effective_control_stack_end = th->control_stack_end;
+#endif
 
     if (is_recycled) {
 #if GENCGC_IS_PRECISE
