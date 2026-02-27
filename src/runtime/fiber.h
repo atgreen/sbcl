@@ -33,6 +33,7 @@ struct fiber_stack {
     void* base;       /* mmap'd region (low address) */
     size_t size;      /* total size including guard page */
     size_t guard_size; /* size of guard page at bottom */
+    struct fiber_stack* pool_next; /* free-list link when in stack pool */
 };
 
 /* GC information for a suspended fiber (doubly-linked list) */

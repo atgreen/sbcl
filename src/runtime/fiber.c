@@ -54,14 +54,119 @@ static size_t round_up_to_page(size_t size)
     return (size + ps - 1) & ~(ps - 1);
 }
 
+/* ===== Stack pool =====
+ *
+ * Reuse mmap'd stack regions across fiber lifetimes to avoid the cost
+ * of mmap/munmap syscalls on every fiber create/destroy.  Two separate
+ * pools: one for control stacks (with guard page) and one for binding
+ * stacks (no guard page).  Each pool caches stacks of a single size
+ * (the first size seen); mismatched sizes bypass the pool.
+ *
+ * On return to pool, madvise(MADV_DONTNEED) releases physical pages
+ * while keeping the virtual mapping.  The kernel provides zero-filled
+ * pages on next access.  Guard page protection (PROT_NONE) is
+ * unaffected by madvise.
+ */
+
+#define FIBER_STACK_POOL_MAX 4096
+
+static struct fiber_stack *cstack_pool_head = NULL;
+static int    cstack_pool_count = 0;
+static size_t cstack_pool_size  = 0; /* total size of cached entries */
+
+static struct fiber_stack *bstack_pool_head = NULL;
+static int    bstack_pool_count = 0;
+static size_t bstack_pool_size  = 0;
+
+#ifdef LISP_FEATURE_WIN32
+static fiber_lock_t cstack_pool_lock;
+static fiber_lock_t bstack_pool_lock;
+static INIT_ONCE pool_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_pool_locks(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&cstack_pool_lock);
+    InitializeCriticalSection(&bstack_pool_lock);
+    return TRUE;
+}
+static void ensure_pool_locks(void)
+{
+    InitOnceExecuteOnce(&pool_lock_once, init_pool_locks, NULL, NULL);
+}
+#else
+static fiber_lock_t cstack_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static fiber_lock_t bstack_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static void ensure_pool_locks(void) {}
+#endif
+
+/* Try to grab a stack from a pool.  Returns NULL on miss. */
+static struct fiber_stack*
+pool_try_alloc(struct fiber_stack **head, int *count, size_t *cached_size,
+               fiber_lock_t *lock, size_t total)
+{
+    struct fiber_stack *result = NULL;
+    ensure_pool_locks();
+    FIBER_LOCK(*lock);
+    if (*count > 0 && *cached_size == total) {
+        result = *head;
+        *head = result->pool_next;
+        (*count)--;
+        result->pool_next = NULL;
+    }
+    FIBER_UNLOCK(*lock);
+    return result;
+}
+
+/* Return a stack to pool, or deallocate if pool full / size mismatch. */
+static void
+pool_return(struct fiber_stack **head, int *count, size_t *cached_size,
+            fiber_lock_t *lock, struct fiber_stack *stack)
+{
+    ensure_pool_locks();
+
+    /* Release physical pages while keeping the virtual mapping.
+     * Only madvise the usable portion (skip the guard page). */
+#ifdef LISP_FEATURE_LINUX
+    {
+        char *usable = (char*)stack->base + stack->guard_size;
+        size_t usable_size = stack->size - stack->guard_size;
+        if (usable_size > 0)
+            madvise(usable, usable_size, MADV_DONTNEED);
+    }
+#endif
+
+    FIBER_LOCK(*lock);
+    if (*count < FIBER_STACK_POOL_MAX
+        && (*count == 0 || *cached_size == stack->size)) {
+        *cached_size = stack->size;
+        stack->pool_next = *head;
+        *head = stack;
+        (*count)++;
+        FIBER_UNLOCK(*lock);
+    } else {
+        FIBER_UNLOCK(*lock);
+        /* Pool full or size mismatch — actually deallocate */
+        os_deallocate(stack->base, stack->size);
+        free(stack);
+    }
+}
+
 struct fiber_stack*
 alloc_fiber_stack(size_t size)
 {
-    struct fiber_stack* stack = malloc(sizeof(struct fiber_stack));
-    if (!stack) return NULL;
-
     size_t ps = os_vm_page_size;
     size_t total = round_up_to_page(size) + ps; /* +1 page for guard */
+
+    /* Try pool first */
+    struct fiber_stack *stack = pool_try_alloc(&cstack_pool_head,
+                                              &cstack_pool_count,
+                                              &cstack_pool_size,
+                                              &cstack_pool_lock, total);
+    if (stack) return stack;
+
+    /* Allocate fresh */
+    stack = malloc(sizeof(struct fiber_stack));
+    if (!stack) return NULL;
 
     os_vm_address_t mem = os_allocate(total);
     if (!mem) {
@@ -75,26 +180,41 @@ alloc_fiber_stack(size_t size)
     stack->base = mem;
     stack->size = total;
     stack->guard_size = ps;
+    stack->pool_next = NULL;
     return stack;
 }
 
 void
 free_fiber_stack(struct fiber_stack* stack)
 {
-    if (stack) {
-        os_deallocate(stack->base, stack->size);
-        free(stack);
+    if (!stack) return;
+
+    if (stack->guard_size > 0) {
+        /* Control stack — return to control stack pool */
+        pool_return(&cstack_pool_head, &cstack_pool_count, &cstack_pool_size,
+                    &cstack_pool_lock, stack);
+    } else {
+        /* Binding stack — return to binding stack pool */
+        pool_return(&bstack_pool_head, &bstack_pool_count, &bstack_pool_size,
+                    &bstack_pool_lock, stack);
     }
 }
 
 struct fiber_stack*
 alloc_fiber_binding_stack(size_t size)
 {
-    /* Binding stacks don't need a guard page - they're bounds-checked */
-    struct fiber_stack* stack = malloc(sizeof(struct fiber_stack));
-    if (!stack) return NULL;
-
     size_t total = round_up_to_page(size);
+
+    /* Try pool first */
+    struct fiber_stack *stack = pool_try_alloc(&bstack_pool_head,
+                                              &bstack_pool_count,
+                                              &bstack_pool_size,
+                                              &bstack_pool_lock, total);
+    if (stack) return stack;
+
+    /* Binding stacks don't need a guard page - they're bounds-checked */
+    stack = malloc(sizeof(struct fiber_stack));
+    if (!stack) return NULL;
 
     os_vm_address_t mem = os_allocate(total);
     if (!mem) {
@@ -105,6 +225,7 @@ alloc_fiber_binding_stack(size_t size)
     stack->base = mem;
     stack->size = total;
     stack->guard_size = 0;
+    stack->pool_next = NULL;
     return stack;
 }
 
