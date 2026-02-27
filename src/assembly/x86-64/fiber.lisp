@@ -41,10 +41,25 @@
   (inst push r14-tn)
   (inst push r15-tn)
 
+  ;; Win64 ABI: XMM6-XMM15 are callee-saved.
+  #+win32
+  (progn
+    (inst sub rsp-tn (* 16 10))
+    (dotimes (i 10)
+      (inst movdqu (ea (* i 16) rsp-tn)
+            (sb-x86-64-asm::get-fpr :xmm (+ 6 i)))))
+
   ;; *old-slot = RSP
   (inst mov (ea old-slot) rsp-tn)
   ;; RSP = *new-slot
   (inst mov rsp-tn (ea new-slot))
+
+  #+win32
+  (progn
+    (dotimes (i 10)
+      (inst movdqu (sb-x86-64-asm::get-fpr :xmm (+ 6 i))
+            (ea (* i 16) rsp-tn)))
+    (inst add rsp-tn (* 16 10)))
 
   ;; Restore callee-saved registers (reverse order).
   (inst pop r15-tn)

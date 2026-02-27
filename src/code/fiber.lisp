@@ -421,6 +421,7 @@ fiber_switch 'returns' into fiber_entry_trampoline."
       #+(and x86-64 (not arm64) (not arm))
       ;; x86-64 — original code for SysV and Win64
       (progn
+        ;; NOTE: stack_top is page-aligned (mmap), so 16-byte alignment holds.
         ;; Layout (offsets from stack_top, growing downward):
         ;; SysV ABI (6 callee-saved: rbp, rbx, r12-r15):
         ;;   stack_top - 0x08: [alignment padding: 0]
@@ -446,7 +447,8 @@ fiber_switch 'returns' into fiber_entry_trampoline."
         ;;   stack_top - 0x48: [0] -> popped into r13
         ;;   stack_top - 0x50: [0] -> popped into r14
         ;;   stack_top - 0x58: [0] -> popped into r15
-        ;;                     ^--- initial RSP (88 bytes from top)
+        ;;   stack_top - 0xF8: [XMM6..XMM15 spill area, 160 bytes]
+        ;;                     ^--- initial RSP (248 bytes from top)
         (setf (sb-sys:sap-ref-word sap -8) 0)   ; alignment padding
         (setf (sb-sys:sap-ref-word sap -16) 0)  ; spare slot
         (setf (sb-sys:sap-ref-word sap -24) trampoline-addr)  ; return addr
@@ -460,8 +462,14 @@ fiber_switch 'returns' into fiber_entry_trampoline."
           (setf (sb-sys:sap-ref-word sap -72) 0)  ; -> r13
           (setf (sb-sys:sap-ref-word sap -80) 0)  ; -> r14
           (setf (sb-sys:sap-ref-word sap -88) 0)  ; -> r15
-          ;; Initial RSP = stack_top - 88 (8 regs * 8 + return addr + padding)
-          (setf (fiber-saved-rsp fiber) (- stack-top 88)))
+          ;; XMM6..XMM15 spill area (10 registers * 16 bytes)
+          (let ((xmm-base (- stack-top 248)))
+            (dotimes (i 20)
+              (setf (sb-sys:sap-ref-word (sb-sys:int-sap xmm-base)
+                                         (* i sb-vm:n-word-bytes))
+                    0)))
+          ;; Initial RSP = stack_top - 248
+          (setf (fiber-saved-rsp fiber) (- stack-top 248)))
         #-win32
         (progn
           (setf (sb-sys:sap-ref-word sap -48) 0)  ; -> r12
