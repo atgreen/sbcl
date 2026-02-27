@@ -1059,6 +1059,33 @@ Only works within a fiber context."
                      (truncate (* seconds internal-time-units-per-second)))))
     (fiber-yield (lambda () (>= (get-internal-real-time) deadline)))))
 
+(defun %fiber-sleep (seconds)
+  "Fiber dispatch for CL:SLEEP. Returns :PINNED-FALL-THROUGH if pinned."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'sleep)
+    (return-from %fiber-sleep :pinned-fall-through))
+  (fiber-sleep seconds)
+  nil)
+
+(defun %fiber-wait-for (test stop-sec stop-usec)
+  "Fiber dispatch for SB-EXT:WAIT-FOR. Returns :PINNED-FALL-THROUGH if pinned."
+  (declare (function test))
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'wait-for)
+    (return-from %fiber-wait-for :pinned-fall-through))
+  (let ((timeout
+          (when stop-sec
+            (let ((remaining-usec
+                    (- (+ (* 1000000 stop-sec) stop-usec)
+                       (multiple-value-bind (sec usec)
+                           (decode-internal-time (get-internal-real-time))
+                         (+ (* 1000000 sec) usec)))))
+              (when (plusp remaining-usec)
+                (/ remaining-usec 1000000.0d0))))))
+    (if (and timeout (not (plusp timeout)))
+        nil  ; already timed out
+        (fiber-park test :timeout timeout))))
+
 (defun fiber-alive-p (fiber)
   "Return true if the fiber has not yet finished."
   (not (eq (fiber-state fiber) :dead)))

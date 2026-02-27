@@ -245,6 +245,11 @@ any non-negative real number."
            :format-arguments (list seconds)
            :datum seconds
            :expected-type '(real 0)))
+  #+sb-fiber
+  (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
+    (let ((result (funcall 'sb-thread::%fiber-sleep seconds)))
+      (unless (eq result :pinned-fall-through)
+        (return-from sleep nil))))
   (if *deadline*
       (let ((start (get-internal-real-time))
             ;; SECONDS can be too large to present as INTERNAL-TIME,

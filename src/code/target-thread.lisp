@@ -636,6 +636,11 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
            (try-ticks (progn
                         (try) (try) (try)
                         (max 1 (truncate (- (get-tick) start) 3)))))
+      #+sb-fiber
+      (when (and *current-fiber* *current-scheduler*)
+        (let ((result (funcall '%fiber-wait-for test stop-sec stop-usec)))
+          (unless (eq result :pinned-fall-through)
+            (return-from %%wait-for result))))
       ;; Scale sleeping between attempts:
       ;;
       ;; Start by sleeping for as many ticks as an average attempt
