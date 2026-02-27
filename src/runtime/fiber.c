@@ -24,16 +24,27 @@
 /* ===== Global fiber GC list ===== */
 
 struct fiber_gc_info* all_fiber_gc_info = NULL;
+#ifdef LISP_FEATURE_WIN32
 fiber_lock_t fiber_gc_lock;
-static int fiber_gc_lock_initialized = 0;
-
+static INIT_ONCE fiber_gc_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_fiber_gc_lock(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    InitializeCriticalSection(&fiber_gc_lock);
+    return TRUE;
+}
 static void ensure_fiber_gc_lock(void)
 {
-    if (!fiber_gc_lock_initialized) {
-        FIBER_LOCK_INIT(fiber_gc_lock);
-        fiber_gc_lock_initialized = 1;
-    }
+    InitOnceExecuteOnce(&fiber_gc_lock_once, init_fiber_gc_lock, NULL, NULL);
 }
+#else
+fiber_lock_t fiber_gc_lock = PTHREAD_MUTEX_INITIALIZER;
+static void ensure_fiber_gc_lock(void)
+{
+}
+#endif
 
 /* ===== Stack allocation ===== */
 
@@ -159,29 +170,42 @@ free_fiber_gc_info(struct fiber_gc_info* info)
  */
 
 static struct active_fiber_context* all_active_fiber_contexts = NULL;
+#ifdef LISP_FEATURE_WIN32
 static fiber_lock_t active_fiber_context_lock;
-static int active_fiber_context_lock_initialized = 0;
+static INIT_ONCE active_fiber_context_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_active_fiber_context_lock(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    InitializeCriticalSection(&active_fiber_context_lock);
+    return TRUE;
+}
+#else
+static fiber_lock_t active_fiber_context_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 /* Per-thread cached context (allocated once, reused across fiber switches) */
 #ifdef LISP_FEATURE_GCC_TLS
 static __thread struct active_fiber_context* my_active_fiber_context = NULL;
 #elif defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
 static pthread_key_t active_fiber_context_key;
-static int active_fiber_context_key_initialized = 0;
+static pthread_once_t active_fiber_context_key_once = PTHREAD_ONCE_INIT;
+static void init_active_fiber_context_key(void)
+{
+    pthread_key_create(&active_fiber_context_key, NULL);
+}
 #endif
 
 static void ensure_active_fiber_context_lock(void)
 {
-    if (!active_fiber_context_lock_initialized) {
-        FIBER_LOCK_INIT(active_fiber_context_lock);
-        active_fiber_context_lock_initialized = 1;
-#if !defined(LISP_FEATURE_GCC_TLS) && defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
-        if (!active_fiber_context_key_initialized) {
-            pthread_key_create(&active_fiber_context_key, NULL);
-            active_fiber_context_key_initialized = 1;
-        }
+#ifdef LISP_FEATURE_WIN32
+    InitOnceExecuteOnce(&active_fiber_context_lock_once,
+                        init_active_fiber_context_lock, NULL, NULL);
 #endif
-    }
+#if !defined(LISP_FEATURE_GCC_TLS) && defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_WIN32)
+    pthread_once(&active_fiber_context_key_once, init_active_fiber_context_key);
+#endif
 }
 
 static struct active_fiber_context* get_my_context(void)
