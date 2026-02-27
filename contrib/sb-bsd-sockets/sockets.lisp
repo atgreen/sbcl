@@ -100,6 +100,9 @@ directly instantiated.")))
 
 
 (defmethod socket-accept ((socket socket))
+  #+sb-fiber
+  (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
+    (return-from socket-accept (%fiber-socket-accept socket)))
   (with-socket-fd-and-addr (fd sockaddr size) socket
     (socket-error-case ("accept" (sockint::accept fd sockaddr size) new-fd)
         (multiple-value-call #'values
@@ -112,7 +115,39 @@ directly instantiated.")))
           (bits-of-sockaddr socket sockaddr))
       (:interrupted nil))))
 
+#+sb-fiber
+(defun %fiber-socket-accept (socket)
+  "Fiber-aware accept: yield fiber instead of blocking carrier."
+  (let* ((fd (socket-file-descriptor socket))
+         (was-non-blocking (non-blocking-mode socket)))
+    (unwind-protect
+         (progn
+           (unless was-non-blocking
+             (setf (non-blocking-mode socket) t))
+           (with-socket-addr (sockaddr size) socket
+             (loop
+               (let ((new-fd (sockint::accept fd sockaddr size)))
+                 (cond ((not (= new-fd -1))
+                        (return
+                          (multiple-value-call #'values
+                            (let ((s (make-instance (class-of socket)
+                                                    :type (socket-type socket)
+                                                    :protocol (socket-protocol socket)
+                                                    :descriptor new-fd)))
+                              (sb-ext:finalize s (lambda () (sockint::close new-fd))
+                                               :dont-save t))
+                            (bits-of-sockaddr socket sockaddr))))
+                       ((interrupted-p (socket-errno))
+                        (sb-sys:wait-until-fd-usable fd :input nil))
+                       (t
+                        (socket-error "accept")))))))
+      (unless was-non-blocking
+        (setf (non-blocking-mode socket) nil)))))
+
 (defmethod socket-connect ((socket socket) &rest peer)
+  #+sb-fiber
+  (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
+    (return-from socket-connect (apply #'%fiber-socket-connect socket peer)))
   (with-socket-fd-and-addr (fd sockaddr size peer) socket
     (cond ((= (sb-bsd-sockets-internal::connect fd sockaddr size) -1)
            (let ((errno (socket-errno)))
@@ -124,6 +159,32 @@ directly instantiated.")))
                    (t
                     (socket-error "connect" errno)))))
           (t socket))))
+
+#+sb-fiber
+(defun %fiber-socket-connect (socket &rest peer)
+  "Fiber-aware connect: yield fiber instead of blocking carrier."
+  (let* ((fd (socket-file-descriptor socket))
+         (was-non-blocking (non-blocking-mode socket)))
+    (unwind-protect
+         (progn
+           (unless was-non-blocking
+             (setf (non-blocking-mode socket) t))
+           (with-socket-addr (sockaddr size peer) socket
+             (let ((result (sb-bsd-sockets-internal::connect fd sockaddr size)))
+               (cond ((zerop result) socket)
+                     (t
+                      (let ((errno (socket-errno)))
+                        (cond ((or (= errno sockint::EINPROGRESS)
+                                   (= errno sockint::EAGAIN)
+                                   (= errno sb-bsd-sockets-internal::eintr))
+                               (sb-sys:wait-until-fd-usable fd :output nil)
+                               (when (= (sockopt-error socket) -1)
+                                 (socket-error "connect"))
+                               socket)
+                              (t
+                               (socket-error "connect" errno)))))))))
+      (unless was-non-blocking
+        (setf (non-blocking-mode socket) nil)))))
 
 (defmethod socket-peername ((socket socket))
   (with-socket-fd-and-addr (fd sockaddr size) socket
