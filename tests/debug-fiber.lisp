@@ -6,7 +6,7 @@
         sb-thread::+default-fiber-stack-size+
         (/ sb-thread::+default-fiber-stack-size+ 1024))
 
-(let* ((sched (sb-thread:make-fiber-scheduler))
+(let* ((sched (sb-thread::make-fiber-scheduler))
        (result nil))
   ;; First fiber: creates object and yields
   (sb-thread:submit-fiber sched
@@ -49,7 +49,7 @@
          (gc :full t)
          (format t "GC completed successfully!~%")))
      :name "gc-trigger"))
-  (sb-thread:run-fiber-scheduler sched)
+  (sb-thread::run-fiber-scheduler sched)
   (format t "Result: ~A~%" result)
   (assert (equal result '(1 2 3))))
 

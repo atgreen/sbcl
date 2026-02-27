@@ -8,6 +8,10 @@
 ;;;; more information.
 
 (use-package "SB-THREAD")
+;; Import internal symbols used by tests
+(import '(sb-thread::make-fiber-scheduler
+          sb-thread::run-fiber-scheduler
+          sb-thread::fd-ready-p))
 
 ;;; Basic fiber creation and execution
 (with-test (:name (:fiber :basic-run) :skipped-on :win32)

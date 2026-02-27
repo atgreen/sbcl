@@ -184,7 +184,12 @@
   (schedulers #() :type simple-vector)
   ;; Total active (non-dead) fibers across all carriers.
   ;; Typed T (holds fixnum) so CAS works for atomic decrement.
-  (active-count 0 :type t))
+  (active-count 0 :type t)
+  ;; Carrier threads (all background, for start-fibers/finish-fibers)
+  (threads nil :type list)
+  ;; Fibers submitted to this group (for result collection).
+  ;; Typed T so that CAS/ATOMIC-PUSH works for dynamic submission.
+  (fibers nil :type t))
 
 ;;;; ===== Fiber Scheduler struct =====
 
@@ -253,6 +258,12 @@
       (format stream "~S" state)
       (when (and carrier (eq state :running))
         (format stream " on ~S" carrier)))))
+
+(defmethod print-object ((group fiber-scheduler-group) stream)
+  (print-unreadable-object (group stream :type t :identity t)
+    (format stream "~D carrier~:P, ~D active"
+            (length (fsg-schedulers group))
+            (fsg-active-count group))))
 
 ;;;; ===== Per-thread scheduler =====
 ;;;
@@ -960,11 +971,29 @@ back to the scheduler."
               (fiber-scheduler-registered-fds sched) (make-hash-table))))
     sched))
 
-(defun submit-fiber (scheduler fiber)
-  "Submit a fiber to a scheduler for execution."
-  (setf (fiber-scheduler fiber) scheduler
-        (fiber-state fiber) :runnable)
-  (wsd-push (fiber-scheduler-run-deque scheduler) fiber))
+(defun submit-fiber (target fiber)
+  "Submit a fiber for execution.
+TARGET can be a FIBER-SCHEDULER (pushes directly to its deque) or a
+FIBER-SCHEDULER-GROUP (atomically increments active-count, picks a random
+scheduler, and pushes to its deque)."
+  (etypecase target
+    (fiber-scheduler
+     (setf (fiber-scheduler fiber) target
+           (fiber-state fiber) :runnable)
+     (wsd-push (fiber-scheduler-run-deque target) fiber))
+    (fiber-scheduler-group
+     ;; Atomically increment active-count so carriers don't exit prematurely
+     (loop for old = (fsg-active-count target)
+           until (eq (sb-ext:cas (fsg-active-count target) old (1+ old))
+                     old))
+     ;; Track fiber for result collection by finish-fibers
+     (sb-ext:atomic-push fiber (fsg-fibers target))
+     ;; Pick a random scheduler and push
+     (let* ((schedulers (fsg-schedulers target))
+            (sched (aref schedulers (random (length schedulers)))))
+       (setf (fiber-scheduler fiber) sched
+             (fiber-state fiber) :runnable)
+       (wsd-push (fiber-scheduler-run-deque sched) fiber)))))
 
 (defun try-steal-fiber (scheduler)
   "Try to steal a fiber from a sibling scheduler in the group.
@@ -1427,49 +1456,60 @@ Called when no fibers are runnable but some are waiting."
         (setf online (min online cgroup))))
     (max 1 online)))
 
+(defun start-fibers (fibers &key (carrier-count (%default-carrier-count)) idle-hook)
+  "Start FIBERS across CARRIER-COUNT background carrier threads.
+Returns a FIBER-SCHEDULER-GROUP handle immediately.  All carriers run on
+background threads (even when CARRIER-COUNT is 1).  Use FINISH-FIBERS to
+join the carriers and collect results, or FIBER-GROUP-DONE-P to poll."
+  (let ((fibers (coerce fibers 'list)))
+    (when (null fibers) (return-from start-fibers nil))
+    (let* ((schedulers (loop repeat carrier-count
+                             collect (make-fiber-scheduler :idle-hook idle-hook)))
+           (sched-vec (coerce schedulers 'simple-vector))
+           (group (%make-fiber-scheduler-group
+                   :schedulers sched-vec
+                   :active-count (length fibers)
+                   :fibers fibers)))
+      ;; Link schedulers to group
+      (loop for s across sched-vec
+            for i from 0
+            do (setf (fiber-scheduler-group s) group
+                     (fiber-scheduler-index s) i))
+      ;; Distribute fibers round-robin
+      (loop for f in fibers
+            for i from 0
+            do (submit-fiber (aref sched-vec (mod i carrier-count)) f))
+      ;; Spawn ALL carriers as background threads
+      (let ((threads nil))
+        (dolist (sched schedulers)
+          (push (make-thread (lambda () (run-fiber-scheduler sched))
+                             :name "fiber-carrier")
+                threads))
+        (setf (fsg-threads group) (nreverse threads)))
+      group)))
+
+(defun finish-fibers (group)
+  "Join all carrier threads in GROUP and return a list of fiber results.
+Blocks until all fibers have completed."
+  (when (null group) (return-from finish-fibers nil))
+  (dolist (th (fsg-threads group))
+    (join-thread th))
+  (mapcar #'fiber-result (fsg-fibers group)))
+
+(defun fiber-group-done-p (group)
+  "Return T if all fibers in GROUP have completed (non-blocking check)."
+  (if (null group)
+      t
+      (zerop (the fixnum (fsg-active-count group)))))
+
 (defun run-fibers (fibers &key (carrier-count (%default-carrier-count)) idle-hook)
   "Run FIBERS across CARRIER-COUNT carrier threads.  Returns a list of
 fiber results when all fibers have completed.
-When CARRIER-COUNT is 1, runs on the current thread (no group overhead).
-When > 1, creates a work-stealing group and spawns CARRIER-COUNT-1 worker
-threads.  Idle carriers steal runnable fibers from busy carriers."
-  (let ((fibers (coerce fibers 'list)))
-    (when (null fibers) (return-from run-fibers nil))
-    (if (<= carrier-count 1)
-        ;; Single-carrier: run on current thread (no group needed)
-        (let ((sched (make-fiber-scheduler :idle-hook idle-hook)))
-          (dolist (f fibers)
-            (submit-fiber sched f))
-          (run-fiber-scheduler sched)
-          (mapcar #'fiber-result fibers))
-        ;; Multi-carrier with work-stealing
-        (let* ((schedulers (loop repeat carrier-count
-                                 collect (make-fiber-scheduler :idle-hook idle-hook)))
-               (sched-vec (coerce schedulers 'simple-vector))
-               (group (%make-fiber-scheduler-group
-                       :schedulers sched-vec
-                       :active-count (length fibers)))
-               (threads nil))
-          ;; Link schedulers to group
-          (loop for s across sched-vec
-                for i from 0
-                do (setf (fiber-scheduler-group s) group
-                         (fiber-scheduler-index s) i))
-          ;; Distribute fibers round-robin
-          (loop for f in fibers
-                for i from 0
-                do (submit-fiber (aref sched-vec (mod i carrier-count)) f))
-          ;; Spawn N-1 worker threads for schedulers 1..N-1
-          (dolist (sched (rest schedulers))
-            (push (make-thread (lambda () (run-fiber-scheduler sched))
-                               :name "fiber-carrier")
-                  threads))
-          ;; Run the first scheduler on the current thread
-          (run-fiber-scheduler (first schedulers))
-          ;; Wait for all worker threads
-          (dolist (th threads)
-            (join-thread th))
-          (mapcar #'fiber-result fibers)))))
+Convenience wrapper around START-FIBERS + FINISH-FIBERS."
+  (if (null fibers)
+      nil
+      (finish-fibers (start-fibers fibers :carrier-count carrier-count
+                                          :idle-hook idle-hook))))
 
 ;;;; ===== Fiber Backtrace =====
 
@@ -1533,7 +1573,6 @@ for foreign frames.  Only works for :SUSPENDED or :CREATED fibers."
 ;;;; ===== Exports =====
 
 (export '(make-fiber
-          destroy-fiber
           fiber
           fiber-name
           fiber-state
@@ -1549,18 +1588,13 @@ for foreign frames.  Only works for :SUSPENDED or :CREATED fibers."
           with-fiber-pinned
           *pinned-blocking-action*
           current-fiber
-          make-fiber-scheduler
           submit-fiber
-          run-fiber-scheduler
           run-fibers
-          %default-carrier-count
-          fiber-scheduler
+          start-fibers
+          finish-fibers
+          fiber-group-done-p
+          fiber-scheduler-group
           *current-fiber*
           *current-scheduler*
-          fd-ready-p
-          fiber-io-idle-hook
-          fiber-wait-info
-          fiber-wait-info-fd
-          fiber-wait-info-direction
           list-all-fibers
           fiber-get-backtrace))
