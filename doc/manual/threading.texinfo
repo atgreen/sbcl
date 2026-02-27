@@ -304,23 +304,15 @@ blocking the carrier thread.
 @subsection Basic Usage
 
 @lisp
-(let ((sched (sb-thread:make-fiber-scheduler)))
-  (sb-thread:submit-fiber
-   sched
-   (sb-thread:make-fiber
-    (lambda () (format t "Hello from fiber 1~%"))))
-  (sb-thread:submit-fiber
-   sched
-   (sb-thread:make-fiber
-    (lambda () (format t "Hello from fiber 2~%"))))
-  (sb-thread:run-fiber-scheduler sched))
+(sb-thread:run-fibers
+  (list (sb-thread:make-fiber (lambda () (format t "Hello from fiber 1~%")))
+        (sb-thread:make-fiber (lambda () (format t "Hello from fiber 2~%")))))
 @end lisp
 
 @subsection Fiber Objects
 
 @include struct-sb-thread-fiber.texinfo
 @include fun-sb-thread-make-fiber.texinfo
-@include fun-sb-thread-destroy-fiber.texinfo
 @include fun-sb-thread-fiber-alive-p.texinfo
 @include fun-sb-thread-fiber-name.texinfo
 @include fun-sb-thread-fiber-state.texinfo
@@ -351,56 +343,53 @@ such as foreign memory or OS-level locks.
 
 @subsection Scheduling
 
-@include struct-sb-thread-fiber-scheduler.texinfo
-@include fun-sb-thread-make-fiber-scheduler.texinfo
+@code{run-fibers} is the simplest way to run fibers: it starts carrier
+threads, runs all supplied fibers to completion, and returns their
+results.  For long-lived or dynamic workloads, use @code{start-fibers}
+to obtain a @code{fiber-scheduler-group} handle, submit additional
+fibers with @code{submit-fiber}, poll with @code{fiber-group-done-p},
+and collect results with @code{finish-fibers}.
+
+@include fun-sb-thread-run-fibers.texinfo
+@include fun-sb-thread-start-fibers.texinfo
+@include fun-sb-thread-finish-fibers.texinfo
+@include fun-sb-thread-fiber-group-done-p.texinfo
+@include struct-sb-thread-fiber-scheduler-group.texinfo
 @include fun-sb-thread-submit-fiber.texinfo
-@include fun-sb-thread-run-fiber-scheduler.texinfo
-
-@subsection I/O Integration
-
-Fibers integrate with SBCL's I/O system.  When
-@code{wait-until-fd-usable} is called from within a fiber, the fiber
-yields and is automatically resumed when the file descriptor becomes
-ready.  The scheduler uses epoll (Linux), kqueue (BSD/macOS), or
-@code{serve-event} as a fallback for efficient I/O multiplexing.
-
-@include fun-sb-thread-fd-ready-p.texinfo
-@include fun-sb-thread-fiber-io-idle-hook.texinfo
-@include struct-sb-thread-fiber-wait-info.texinfo
 
 @subsection Example: Concurrent I/O
 
 @lisp
 (defun fiber-echo-server (port)
   "Run a simple echo server with one fiber per connection."
-  (let* ((sched (sb-thread:make-fiber-scheduler))
-         (server (sb-bsd-sockets:make-inet-socket :stream :tcp)))
+  (let ((server (sb-bsd-sockets:make-inet-socket :stream :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address server) t)
     (sb-bsd-sockets:socket-bind server #(127 0 0 1) port)
     (sb-bsd-sockets:socket-listen server 5)
-    ;; Acceptor fiber
-    (sb-thread:submit-fiber sched
-      (sb-thread:make-fiber
-       (lambda ()
-         (loop repeat 3  ; accept 3 connections then stop
-               do (let* ((fd (sb-bsd-sockets:socket-file-descriptor server))
-                         (client (progn
-                                   (sb-sys:wait-until-fd-usable fd :input nil)
-                                   (sb-bsd-sockets:socket-accept server))))
-                    ;; Spawn a handler fiber per connection
-                    (sb-thread:submit-fiber
-                     (sb-thread:current-scheduler)
-                     (sb-thread:make-fiber
-                      (lambda ()
-                        (let ((stream (sb-bsd-sockets:socket-make-stream
-                                       client :input t :output t)))
-                          (unwind-protect
-                               (loop for line = (read-line stream nil)
-                                     while line
-                                     do (write-line line stream)
-                                        (force-output stream))
-                            (close stream)))))))))))
-    (sb-thread:run-fiber-scheduler sched)))
+    ;; Start with an acceptor fiber; it dynamically spawns handler fibers
+    (let ((group (sb-thread:start-fibers
+                   (list (sb-thread:make-fiber
+                           (lambda ()
+                             (loop repeat 3  ; accept 3 connections then stop
+                                   do (let* ((fd (sb-bsd-sockets:socket-file-descriptor server))
+                                             (client (progn
+                                                       (sb-sys:wait-until-fd-usable fd :input nil)
+                                                       (sb-bsd-sockets:socket-accept server))))
+                                        ;; Spawn a handler fiber into the same group
+                                        (sb-thread:submit-fiber
+                                         (sb-thread:fiber-scheduler-group
+                                          sb-thread:*current-scheduler*)
+                                         (sb-thread:make-fiber
+                                          (lambda ()
+                                            (let ((stream (sb-bsd-sockets:socket-make-stream
+                                                           client :input t :output t)))
+                                              (unwind-protect
+                                                   (loop for line = (read-line stream nil)
+                                                         while line
+                                                         do (write-line line stream)
+                                                            (force-output stream))
+                                                (close stream))))))))))))))
+      (sb-thread:finish-fibers group))))
 @end lisp
 
 @node Barriers
