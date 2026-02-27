@@ -1409,7 +1409,25 @@ Called when no fibers are runnable but some are waiting."
 
 ;;;; ===== Multi-carrier scheduling =====
 
-(defun run-fibers (fibers &key (carrier-count 1) idle-hook)
+(defun %default-carrier-count ()
+  "Return the number of available CPUs, respecting cgroup limits on Linux."
+  (let ((online
+          #+win32
+          (deref (extern-alien "os_number_of_processors" int))
+          #-win32
+          (alien-funcall
+           (extern-alien "sysconf" (function long int))
+           #+linux 84    ; _SC_NPROCESSORS_ONLN
+           #+darwin 58   ; _SC_NPROCESSORS_ONLN on macOS
+           #-(or linux darwin) 84)))
+    (when (< online 1) (setf online 1))
+    #+linux
+    (let ((cgroup (sb-sys::%cgroup-effective-cpus)))
+      (when cgroup
+        (setf online (min online cgroup))))
+    (max 1 online)))
+
+(defun run-fibers (fibers &key (carrier-count (%default-carrier-count)) idle-hook)
   "Run FIBERS across CARRIER-COUNT carrier threads.  Returns a list of
 fiber results when all fibers have completed.
 When CARRIER-COUNT is 1, runs on the current thread (no group overhead).
@@ -1535,6 +1553,7 @@ for foreign frames.  Only works for :SUSPENDED or :CREATED fibers."
           submit-fiber
           run-fiber-scheduler
           run-fibers
+          %default-carrier-count
           fiber-scheduler
           *current-fiber*
           *current-scheduler*

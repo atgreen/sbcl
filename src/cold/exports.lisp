@@ -3487,6 +3487,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "MAKE-FIBER-SCHEDULER"
            "RUN-FIBER-SCHEDULER"
            "RUN-FIBERS"
+           "%DEFAULT-CARRIER-COUNT"
            "SUBMIT-FIBER"
            "WITH-FIBER-PINNED"))
 
