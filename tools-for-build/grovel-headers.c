@@ -199,6 +199,8 @@ main(int argc, char __attribute__((unused)) *argv[])
     defconstant("epollout", EPOLLOUT);
     defconstant("epollerr", EPOLLERR);
     defconstant("epollhup", EPOLLHUP);
+    defconstant("epollet", EPOLLET);
+    defconstant("epolloneshot", EPOLLONESHOT);
 #endif
 
 #ifdef LISP_FEATURE_BSD
