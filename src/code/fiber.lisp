@@ -191,7 +191,10 @@
   (threads nil :type list)
   ;; Fibers submitted to this group (for result collection).
   ;; Typed T so that CAS/ATOMIC-PUSH works for dynamic submission.
-  (fibers nil :type t))
+  (fibers nil :type t)
+  ;; Carrier parking: idle carriers block on park-cv instead of spinning
+  (park-lock (sb-thread:make-mutex :name "carrier-park") :type sb-thread:mutex)
+  (park-cv (sb-thread:make-waitqueue :name "carrier-park") :type sb-thread:waitqueue))
 
 ;;;; ===== Fiber Scheduler struct =====
 
@@ -772,6 +775,18 @@ ready to be resumed."
               (sb-sys:sap-ref-word thread-sap catch-offset))
         (setf (fiber-saved-unwind-protect-block fiber)
               (sb-sys:sap-ref-word thread-sap uwp-offset))
+        ;; 1c. Update gc_info's binding-stack-pointer NOW, before we
+        ;;     restore the carrier's BSP (step 3).  After step 3 the
+        ;;     thread's BSP is in the carrier's range, so the
+        ;;     active_fiber_context path won't cover the fiber's binding
+        ;;     stack.  GC can fire here (without-interrupts does NOT
+        ;;     prevent GC), so the gc_info must cover the full binding
+        ;;     stack to avoid missing entries during precise scavenging.
+        (let ((gc-info (fiber-gc-info fiber)))
+          (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
+            (sb-sys:without-gcing
+              (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes))
+                    (fiber-binding-stack-pointer fiber)))))
         ;; 2. Save fiber's TLS values and restore carrier's TLS values.
         ;;    This does NOT call unbind_to_here (which would zero entries).
         ;;    Instead it directly swaps TLS slot values using the binding
@@ -904,7 +919,13 @@ ready to be resumed."
         (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
           (sb-sys:without-gcing
             (setf (sb-sys:sap-ref-word gc-info sb-vm:n-word-bytes)
-                  (fiber-control-stack-start fiber)))))
+                  (fiber-control-stack-start fiber))
+            ;; Also ensure binding_stack_pointer is current.
+            ;; After fiber_switch returns (step 8), the gc_info must
+            ;; cover the fiber's full binding stack because the thread
+            ;; BSP will be the carrier's (set by yield/trampoline).
+            (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes))
+                  (fiber-binding-stack-pointer fiber)))))
       ;; 6. Set effective stack bounds to the fiber's stack so that
       ;;    dynamic-extent overflow checks and stack-allocated-p use
       ;;    the fiber's bounds.  Does NOT touch control-stack-start/end
@@ -1005,6 +1026,15 @@ back to the scheduler."
                            (setf (sb-sys:sap-ref-word thread-sap tls-index)
                                  old-value)))
                     (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
+        ;; Update gc_info's binding-stack-pointer before restoring
+        ;; carrier BSP.  Same rationale as fiber-yield step 1c: after
+        ;; carrier BSP is set, the active_fiber_context won't cover
+        ;; the fiber's binding stack, so the gc_info must be accurate.
+        (let ((gc-info (fiber-gc-info fiber)))
+          (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
+            (sb-sys:without-gcing
+              (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes))
+                    current-bsp))))
         ;; Restore carrier's BSP and catch/UWP blocks
         (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
               (fiber-scheduler-carrier-bsp scheduler))
@@ -1079,7 +1109,9 @@ scheduler, and pushes to its deque)."
             (sched (aref schedulers (random (length schedulers)))))
        (setf (fiber-scheduler fiber) sched
              (fiber-state fiber) :runnable)
-       (sb-ext:atomic-push fiber (fiber-scheduler-pending-fibers sched))))))
+       (sb-ext:atomic-push fiber (fiber-scheduler-pending-fibers sched))
+       ;; Wake one parked carrier to pick up the new work
+       (sb-thread:condition-notify (fsg-park-cv target))))))
 
 (defun try-steal-fiber (scheduler)
   "Try to steal a fiber from a sibling scheduler in the group.
@@ -1253,21 +1285,24 @@ the pointer intact to continue traversal."
 
 #+linux
 (defun %scheduler-harvest-epoll (scheduler timeout-ms)
-  "Run epoll_wait once with TIMEOUT-MS, populate ready-fds hash table.
-With EPOLLET|EPOLLONESHOT, each fd fires at most once per arm cycle."
+  "Run epoll_wait with TIMEOUT-MS, drain all pending events.
+With EPOLLET|EPOLLONESHOT each fd fires at most once, so drain terminates naturally."
   (let ((efd (fiber-scheduler-event-fd scheduler))
         (ready-fds (fiber-scheduler-ready-fds scheduler)))
     (when (minusp efd) (return-from %scheduler-harvest-epoll 0))
     (clrhash ready-fds)
-    (let ((buf (fiber-scheduler-epoll-buf scheduler)))
+    (let ((buf (fiber-scheduler-epoll-buf scheduler))
+          (total 0))
       (sb-sys:with-pinned-objects (buf)
-        (let* ((sap (sb-sys:vector-sap buf))
-               (n (sb-unix:epoll-wait efd sap 64 timeout-ms)))
-          (when (or (null n) (<= n 0))
-            (return-from %scheduler-harvest-epoll 0))
-          (dotimes (i n)
-            (setf (gethash (aref buf i) ready-fds) t))
-          n)))))
+        (let ((sap (sb-sys:vector-sap buf)))
+          (loop for ms = timeout-ms then 0
+                do (let ((n (sb-unix:epoll-wait efd sap 64 ms)))
+                     (when (or (null n) (<= n 0)) (return))
+                     (dotimes (i n)
+                       (setf (gethash (aref buf i) ready-fds) t))
+                     (incf total n)
+                     (when (< n 64) (return))))))
+      total)))
 
 (defun run-fiber-scheduler (scheduler)
   "Run the scheduler loop on the current thread. Returns when all
@@ -1402,8 +1437,11 @@ fibers have completed."
                ;; No local work and no waiting; check group
                (group
                 (if (plusp (the fixnum (fsg-active-count group)))
-                    ;; Other carriers still have active fibers; brief yield then retry
-                    (sb-unix:nanosleep 0 100000)  ; 100us
+                    ;; Park until woken by submit-fiber or timeout
+                    (sb-thread:with-mutex ((fsg-park-lock group))
+                      (sb-thread:condition-wait (fsg-park-cv group)
+                                                (fsg-park-lock group)
+                                                :timeout 0.001))  ; 1ms
                     ;; All fibers globally done
                     (return)))
                ;; Single-carrier mode: all done
