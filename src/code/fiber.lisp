@@ -162,6 +162,8 @@
   ;; I/O wait info (inlined — fd + direction for idle hook batching)
   (wait-fd -1 :type fixnum)
   (wait-direction :input :type (member :input :output))
+  ;; True when this fiber is parked in scheduler io-waiters table.
+  (io-indexed-p nil :type t)
   ;; Deadline for timed waits (internal-real-time units), or NIL
   (deadline nil :type (or null fixnum))
   ;; Intrusive linked list pointer for waiting list (avoids cons allocation)
@@ -209,6 +211,10 @@
   (event-fd -1 :type fixnum)
   ;; Hash table of fd -> registered-events-mask (for epoll ctl tracking)
   (registered-fds nil :type (or null hash-table))
+  ;; Linux fast path: fd -> list of parked fibers waiting on epoll readiness.
+  ;; Only used for waiters without explicit deadlines.
+  (io-waiters (make-hash-table) :type hash-table)
+  (io-waiter-count 0 :type fixnum)
   ;; Work-stealing group (multi-carrier only)
   (group nil :type (or null fiber-scheduler-group))
   ;; Index of this scheduler in the group's schedulers vector
@@ -552,46 +558,56 @@ MAKE-FIBER time."
                 (progv (mapcar #'car bindings)
                        (mapcar #'cdr bindings)
                   (funcall inner)))))))
-  (let ((cstack-sap (alloc-fiber-stack stack-size))
-        (bstack-sap (alloc-fiber-binding-stack binding-stack-size)))
-    (when (or (sb-sys:sap= cstack-sap (sb-sys:int-sap 0))
-              (sb-sys:sap= bstack-sap (sb-sys:int-sap 0)))
-      (error "Failed to allocate fiber stacks"))
-    ;; Extract the base and size from the C struct fiber_stack
-    ;; struct fiber_stack { void* base; size_t size; size_t guard_size; }
-    (let* ((cstack-base (sb-sys:sap-ref-word cstack-sap 0))
-           (cstack-total-size (sb-sys:sap-ref-word cstack-sap sb-vm:n-word-bytes))
-           (cstack-guard-size (sb-sys:sap-ref-word cstack-sap (* 2 sb-vm:n-word-bytes)))
-           ;; Usable stack starts above the guard page
-           (cstack-usable-start (+ cstack-base cstack-guard-size))
-           (cstack-usable-size (- cstack-total-size cstack-guard-size))
-           (bstack-base (sb-sys:sap-ref-word bstack-sap 0))
-           (bstack-total-size (sb-sys:sap-ref-word bstack-sap sb-vm:n-word-bytes))
-           ;; Create GC info
-           (gc-info-sap (make-fiber-gc-info))
-           (fiber (%make-fiber
-                   :name name
-                   :function function
-                   :control-stack-start cstack-usable-start
-                   :control-stack-end (+ cstack-usable-start cstack-usable-size)
-                   :control-stack-size cstack-usable-size
-                   :binding-stack-start bstack-base
-                   :binding-stack-pointer bstack-base  ; empty initially
-                   :binding-stack-size bstack-total-size
-                   :gc-info gc-info-sap
-                   :c-control-stack cstack-sap
-                   :c-binding-stack bstack-sap)))
-      ;; Initialize the stack frame for fiber_switch
-      (initialize-fiber-stack fiber)
-      ;; Register for GC scanning immediately.  The initial stack frame
-      ;; contains the fiber lispobj (a raw tagged pointer).  If GC runs
-      ;; before this fiber starts, the conservative scanner must see that
-      ;; reference to pin the fiber object in place.
-      (register-fiber-for-gc-from-fiber fiber)
-      ;; Register in global fiber list
-      (with-mutex (*all-fibers-lock*)
-        (push fiber *all-fibers*))
-      fiber)))
+  (let ((cstack-sap (alloc-fiber-stack stack-size)))
+    (when (sb-sys:sap= cstack-sap (sb-sys:int-sap 0))
+      (error "Failed to allocate fiber control stack"))
+    (let ((bstack-sap (alloc-fiber-binding-stack binding-stack-size)))
+      (when (sb-sys:sap= bstack-sap (sb-sys:int-sap 0))
+        (free-fiber-stack cstack-sap)
+        (error "Failed to allocate fiber binding stack"))
+      ;; Extract the base and size from the C struct fiber_stack
+      ;; struct fiber_stack { void* base; size_t size; size_t guard_size; }
+      (let* ((cstack-base (sb-sys:sap-ref-word cstack-sap 0))
+             (cstack-total-size (sb-sys:sap-ref-word cstack-sap sb-vm:n-word-bytes))
+             (cstack-guard-size (sb-sys:sap-ref-word cstack-sap (* 2 sb-vm:n-word-bytes)))
+             ;; Usable stack starts above the guard page
+             (cstack-usable-start (+ cstack-base cstack-guard-size))
+             (cstack-usable-size (- cstack-total-size cstack-guard-size))
+             (bstack-base (sb-sys:sap-ref-word bstack-sap 0))
+             (bstack-total-size (sb-sys:sap-ref-word bstack-sap sb-vm:n-word-bytes))
+             ;; Create GC info
+             (gc-info-sap (make-fiber-gc-info))
+             (fiber (%make-fiber
+                     :name name
+                     :function function
+                     :control-stack-start cstack-usable-start
+                     :control-stack-end (+ cstack-usable-start cstack-usable-size)
+                     :control-stack-size cstack-usable-size
+                     :binding-stack-start bstack-base
+                     :binding-stack-pointer bstack-base  ; empty initially
+                     :binding-stack-size bstack-total-size
+                     :gc-info gc-info-sap
+                     :c-control-stack cstack-sap
+                     :c-binding-stack bstack-sap)))
+        (let ((completed nil))
+          (unwind-protect
+               (progn
+                 ;; Initialize the stack frame for fiber_switch
+                 (initialize-fiber-stack fiber)
+                 ;; Register for GC scanning immediately.  The initial stack frame
+                 ;; contains the fiber lispobj (a raw tagged pointer).  If GC runs
+                 ;; before this fiber starts, the conservative scanner must see that
+                 ;; reference to pin the fiber object in place.
+                 (register-fiber-for-gc-from-fiber fiber)
+                 ;; Register in global fiber list
+                 (with-mutex (*all-fibers-lock*)
+                   (push fiber *all-fibers*))
+                 (setf completed t)
+                 fiber)
+            (unless completed
+              (free-fiber-gc-info gc-info-sap)
+              (free-fiber-stack bstack-sap)
+              (free-fiber-stack cstack-sap))))))))
 
 (defun destroy-fiber (fiber)
   "Free the resources associated with FIBER. Only call on dead fibers."
@@ -1033,6 +1049,12 @@ FIBER-SCHEDULER-GROUP (atomically increments active-count, picks a random
 scheduler, and pushes to its deque)."
   (etypecase target
     (fiber-scheduler
+     ;; Direct deque push — only safe from the owner (carrier) thread,
+     ;; or during setup before any carrier has started.
+     (let ((carrier (fiber-scheduler-carrier target)))
+       (when (and carrier (not (eq carrier *current-thread*)))
+         (error "submit-fiber to ~S from non-owner thread (owner: ~S, caller: ~S)"
+                target carrier *current-thread*)))
      (setf (fiber-scheduler fiber) target
            (fiber-state fiber) :runnable)
      (wsd-push (fiber-scheduler-run-deque target) fiber))
@@ -1066,8 +1088,48 @@ Returns the stolen fiber, or NIL."
               for idx = (mod (+ start i) n)
               for victim = (aref schedulers idx)
               unless (eq victim scheduler)
-              do (let ((stolen (wsd-steal (fiber-scheduler-run-deque victim))))
+                  do (let ((stolen (wsd-steal (fiber-scheduler-run-deque victim))))
                    (when stolen (return stolen))))))))
+
+#+linux
+(defun %scheduler-index-io-waiter (scheduler fiber)
+  "Index FIBER in SCHEDULER's epoll waiter table by its wait-fd."
+  (let* ((fd (fiber-wait-fd fiber))
+         (table (fiber-scheduler-io-waiters scheduler)))
+    (setf (gethash fd table) (cons fiber (gethash fd table))
+          (fiber-io-indexed-p fiber) t)
+    (incf (fiber-scheduler-io-waiter-count scheduler))))
+
+#+linux
+(defun %scheduler-wake-ready-io-waiters (scheduler deque)
+  "Wake epoll-indexed fibers whose FDs were reported ready this tick."
+  (let ((ready-fds (fiber-scheduler-ready-fds scheduler))
+        (table (fiber-scheduler-io-waiters scheduler)))
+    (maphash
+     (lambda (fd ignored)
+       (declare (ignore ignored))
+       (let ((waiters (gethash fd table)))
+         (when waiters
+           (remhash fd table)
+           (dolist (f waiters)
+             ;; Skip stale entries defensively (e.g. if state changed early).
+             (when (and (fiber-io-indexed-p f)
+                        (eq (fiber-state f) :suspended))
+               (setf (fiber-io-indexed-p f) nil
+                     (fiber-next-waiting f) nil
+                     (fiber-state f) :runnable
+                     (fiber-wake-condition f) nil)
+               (decf (fiber-scheduler-io-waiter-count scheduler))
+               (wsd-push deque f))))))
+     ready-fds)))
+
+(declaim (inline scheduler-has-waiters-p))
+(defun scheduler-has-waiters-p (scheduler)
+  (or (fiber-scheduler-waiting scheduler)
+      #+linux
+      (plusp (fiber-scheduler-io-waiter-count scheduler))
+      #-linux
+      nil))
 
 (defun run-fiber-scheduler (scheduler)
   "Run the scheduler loop on the current thread. Returns when all
@@ -1113,6 +1175,9 @@ fibers have completed."
                            (dotimes (i n)
                              (setf (gethash (aref buf i) ready-fds) t))
                            (when (< n 64) (return)))))))))
+             #+linux
+             (when (plusp (fiber-scheduler-io-waiter-count scheduler))
+               (%scheduler-wake-ready-io-waiters scheduler deque))
              ;; Walk intrusive waiting list; capture next before modifying
              (loop for f = (fiber-scheduler-waiting scheduler) then next
                    for next = (when f (fiber-next-waiting f))
@@ -1183,11 +1248,24 @@ fibers have completed."
                   (:suspended
                    ;; Move to waiting list if has wake condition, else back to deque
                    (if (fiber-wake-condition fiber)
-                       ;; Intrusive prepend to waiting list (zero allocation)
                        (progn
-                         (setf (fiber-next-waiting fiber)
-                               (fiber-scheduler-waiting scheduler))
-                         (setf (fiber-scheduler-waiting scheduler) fiber))
+                         #+linux
+                         (if (and (plusp (fiber-scheduler-event-fd scheduler))
+                                  (>= (fiber-wait-fd fiber) 0)
+                                  (null (fiber-deadline fiber)))
+                             ;; No-timeout fd waiters are tracked in an fd-indexed map,
+                             ;; avoiding O(n) list scans over mostly idle sockets.
+                             (%scheduler-index-io-waiter scheduler fiber)
+                             ;; Other waiters stay on the generic intrusive list.
+                             (progn
+                               (setf (fiber-next-waiting fiber)
+                                     (fiber-scheduler-waiting scheduler))
+                               (setf (fiber-scheduler-waiting scheduler) fiber)))
+                         #-linux
+                         (progn
+                           (setf (fiber-next-waiting fiber)
+                                 (fiber-scheduler-waiting scheduler))
+                           (setf (fiber-scheduler-waiting scheduler) fiber)))
                        (progn
                          (setf (fiber-state fiber) :runnable)
                          (wsd-push deque fiber))))
@@ -1201,7 +1279,7 @@ fibers have completed."
                    ;; Clean up dead fiber resources
                    (destroy-fiber fiber))))
                ;; No runnable fibers but some waiting
-               ((fiber-scheduler-waiting scheduler)
+               ((scheduler-has-waiters-p scheduler)
                 (let ((hook (fiber-scheduler-idle-hook scheduler)))
                   (if hook
                       (funcall hook scheduler)
@@ -1266,6 +1344,18 @@ sentinel instead of allocating a closure."
 (defun fiber-alive-p (fiber)
   "Return true if the fiber has not yet finished."
   (not (eq (fiber-state fiber) :dead)))
+
+(declaim (inline %relative-decoded-times))
+(defun %relative-decoded-times (abs-sec abs-usec)
+  "Return remaining decoded time until ABS-SEC/ABS-USEC as two values."
+  (multiple-value-bind (now-sec now-usec)
+      (decode-internal-time (get-internal-real-time))
+    (let ((remaining-usec (- (+ (* 1000000 abs-sec) abs-usec)
+                             (+ (* 1000000 now-sec) now-usec))))
+      (if (plusp remaining-usec)
+          (values (truncate remaining-usec 1000000)
+                  (mod remaining-usec 1000000))
+          (values 0 0)))))
 
 ;;;; ===== Pinned-blocking check =====
 
@@ -1356,7 +1446,7 @@ is pinned (caller should use the OS blocking path)."
           (let ((remaining-secs
                   (when stop-sec
                     (multiple-value-bind (sec usec)
-                        (sb-impl::relative-decoded-times stop-sec stop-usec)
+                        (%relative-decoded-times stop-sec stop-usec)
                       (when (and (zerop sec) (not (plusp usec)))
                         (return-from %fiber-condition-wait nil))
                       (+ sec (/ usec 1000000.0d0))))))
@@ -1366,7 +1456,7 @@ is pinned (caller should use the OS blocking path)."
             ;; Success: return T, or (values T remaining-sec remaining-usec)
             (if stop-sec
                 (multiple-value-bind (sec usec)
-                    (sb-impl::relative-decoded-times stop-sec stop-usec)
+                    (%relative-decoded-times stop-sec stop-usec)
                   (values t sec usec))
                 t))))))
 
@@ -1408,20 +1498,41 @@ when fiber is pinned."
   (unless (fiber-can-yield-p)
     (check-pinned-blocking 'wait-until-fd-usable)
     (return-from %fiber-wait-until-fd-usable :pinned-fall-through))
-  ;; Fast check: already ready?
-  (when (fd-ready-p fd direction)
-    (return-from %fiber-wait-until-fd-usable t))
-  ;; Park with fd-readiness wake condition, recording wait-info for idle hook
+  ;; Keep timeout=0 behavior non-blocking.
+  (when (and timeout (not (plusp timeout)))
+    (return-from %fiber-wait-until-fd-usable (fd-ready-p fd direction)))
+  ;; Park with fd-readiness wait-info, using epoll-driven wake when available.
   (let ((fiber *current-fiber*)
         (scheduler *current-scheduler*))
     (setf (fiber-wait-fd fiber) fd
           (fiber-wait-direction fiber) direction)
     (%event-register scheduler fd direction)
     (unwind-protect
+         #+linux
+         (if (plusp (fiber-scheduler-event-fd scheduler))
+             ;; With epoll, avoid per-wake poll() checks and rely on scheduler
+             ;; wakeup + optional deadline handling.
+             (let ((deadline (when timeout
+                               (+ (get-internal-real-time)
+                                  (truncate (* timeout
+                                               internal-time-units-per-second))))))
+               (when deadline
+                 (setf (fiber-deadline fiber) deadline))
+               (fiber-yield #'%always-false)
+               (when deadline
+                 (setf (fiber-deadline fiber) nil))
+               (if (and deadline
+                        (>= (get-internal-real-time) deadline)
+                        (not (fd-ready-p fd direction)))
+                   nil
+                   t))
+             (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
+                                       :timeout timeout)))
+               (if result t nil)))
+         #-linux
          (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
                                    :timeout timeout)))
            (if result t nil))
-      (%event-deregister scheduler fd direction)
       (setf (fiber-wait-fd fiber) -1))))
 
 ;;;; ===== Event multiplexer registration (epoll/kqueue) =====
@@ -1433,14 +1544,17 @@ when fiber is pinned."
     (when (minusp efd) (return-from %event-register))
     #+linux
     (let* ((table (fiber-scheduler-registered-fds scheduler))
-           (new-events (if (eq direction :input)
-                           sb-unix:epollin sb-unix:epollout))
-           (current (gethash fd table 0))
-           (combined (logior current new-events)))
+           (events (if (eq direction :input)
+                       sb-unix:epollin sb-unix:epollout))
+           (current (gethash fd table 0)))
+      (when (= current events)
+        (return-from %event-register))
       (if (zerop current)
-          (sb-unix:epoll-ctl-add efd fd combined)
-          (sb-unix:epoll-ctl-mod efd fd combined))
-      (setf (gethash fd table) combined))
+          (sb-unix:epoll-ctl-add efd fd events)
+          (unless (sb-unix:epoll-ctl-mod efd fd events)
+            (remhash fd table)
+            (sb-unix:epoll-ctl-add efd fd events)))
+      (setf (gethash fd table) events))
     #+bsd
     (%kqueue-register efd fd direction :add)))
 
@@ -1578,6 +1692,9 @@ or NIL if no time-based deadlines exist."
   "Idle hook that polls fds from waiting fibers using a single poll/select call.
 Called when no fibers are runnable but some are waiting."
   (let ((timeout-ms (or (compute-nearest-deadline scheduler) 100))
+        #+linux
+        (has-io-waiters (plusp (fiber-scheduler-io-waiter-count scheduler)))
+        #-linux
         (has-io-waiters nil))
     ;; Check if any waiting fibers have I/O wait info
     (loop for f = (fiber-scheduler-waiting scheduler) then (fiber-next-waiting f)
