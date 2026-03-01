@@ -1811,5 +1811,8 @@
   (let ((b (& (>> val 3) #xf)))
    (let ((a (>> (<< val 7) 28)))
     (^ a (aref tab b))))))")
+(#(C09CD74 42D83FFB 454C7749 45FCB8CA 873646F9 B1368A5E B9C55147 F21E63EC)
+ "(:ALLOW-OTHER-KEYS :CLOSED-P :PARK-CV :PARK-LOCK :FIBERS :THREADS :ACTIVE-COUNT :SCHEDULERS)"
+ "((& (>> val 10) 7))")
 )
 ;; EOF

@@ -209,7 +209,9 @@
   (fibers nil :type t)
   ;; Carrier parking: idle carriers block on park-cv instead of spinning
   (park-lock (sb-thread:make-mutex :name "carrier-park") :type sb-thread:mutex)
-  (park-cv (sb-thread:make-waitqueue :name "carrier-park") :type sb-thread:waitqueue))
+  (park-cv (sb-thread:make-waitqueue :name "carrier-park") :type sb-thread:waitqueue)
+  ;; Set to T when shutdown begins; submit-fiber rejects late submissions
+  (closed-p nil :type boolean))
 
 ;;;; ===== Fiber Scheduler struct =====
 
@@ -1136,6 +1138,9 @@ scheduler, and pushes to its deque)."
            (fiber-state fiber) :runnable)
      (wsd-push (fiber-scheduler-run-deque target) fiber))
     (fiber-scheduler-group
+     ;; Reject submissions after group shutdown has started
+     (when (fsg-closed-p target)
+       (error "Cannot submit fiber to closed group ~S" target))
      ;; Atomically increment active-count so carriers don't exit prematurely
      (loop for old = (fsg-active-count target)
            until (eq (sb-ext:cas (fsg-active-count target) old (1+ old))
@@ -1445,7 +1450,7 @@ fibers have completed."
                                 (wsd-push deque fiber))
                                ;; fd waiter on Linux with epoll → io-waiters (+ heap if deadline)
                                #+linux
-                               ((and has-fd (plusp (fiber-scheduler-event-fd scheduler)))
+                               ((and has-fd (not (minusp (fiber-scheduler-event-fd scheduler))))
                                 (%scheduler-index-io-waiter scheduler fiber)
                                 (when has-deadline
                                   (%heap-insert scheduler fiber)))
@@ -1517,7 +1522,7 @@ fibers have completed."
       ;; Cleanup: close event multiplexer fd
       #+(or linux bsd)
       (let ((efd (fiber-scheduler-event-fd scheduler)))
-        (when (plusp efd)
+        (when (not (minusp efd))
           (sb-unix:unix-close efd)
           (setf (fiber-scheduler-event-fd scheduler) -1))))))
 
@@ -1731,7 +1736,7 @@ when fiber is pinned."
       #+linux
       (let ((scheduler *current-scheduler*))
         (if (and scheduler
-                 (plusp (fiber-scheduler-event-fd scheduler))
+                 (not (minusp (fiber-scheduler-event-fd scheduler)))
                  (gethash fd (fiber-scheduler-ready-fds scheduler)))
             t
             (fd-ready-p fd direction)))
@@ -1745,7 +1750,7 @@ when fiber is pinned."
     (%event-register scheduler fd direction)
     (unwind-protect
          #+linux
-         (if (plusp (fiber-scheduler-event-fd scheduler))
+         (if (not (minusp (fiber-scheduler-event-fd scheduler)))
              ;; With epoll, avoid per-wake poll() checks and rely on scheduler
              ;; wakeup + optional deadline handling.
              (let ((deadline (when timeout
@@ -1787,8 +1792,12 @@ when fiber is pinned."
            (current (gethash fd table 0)))
       (if (zerop current)
           (sb-unix:epoll-ctl-add efd fd events)
-          ;; Re-arm: EPOLLONESHOT disables after one event, MOD re-enables
-          (sb-unix:epoll-ctl-mod efd fd events))
+          ;; Re-arm: EPOLLONESHOT disables after one event, MOD re-enables.
+          ;; If the fd was closed and reopened, the kernel removed the old
+          ;; registration but our table still has a stale entry.  Detect
+          ;; ENOENT from MOD and retry with ADD.
+          (unless (sb-unix:epoll-ctl-mod efd fd events)
+            (sb-unix:epoll-ctl-add efd fd events)))
       (setf (gethash fd table) events))
     #+bsd
     (%kqueue-register efd fd direction :add)))
@@ -1998,6 +2007,8 @@ join the carriers and collect results, or FIBER-GROUP-DONE-P to poll."
   "Join all carrier threads in GROUP and return a list of fiber results.
 Blocks until all fibers have completed."
   (when (null group) (return-from finish-fibers nil))
+  ;; Mark group closed so submit-fiber rejects late submissions
+  (setf (fsg-closed-p group) t)
   (dolist (th (fsg-threads group))
     (join-thread th))
   (mapcar #'fiber-result (fsg-fibers group)))
