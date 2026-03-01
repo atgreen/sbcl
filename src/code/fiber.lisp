@@ -1027,71 +1027,88 @@ MIGRATED is true if the fiber changed carriers (work stealing)."
 the registered Lisp trampoline. Runs the fiber's function with
 error handling, marks it dead, cleans up bindings, and switches
 back to the scheduler."
-  (unwind-protect
-       (handler-case
-           (let ((fn (fiber-function fiber)))
-             (when fn
-               (setf (fiber-result fiber) (funcall fn))))
-         (error (c)
-           (setf (fiber-result fiber) c
-                 (fiber-errorp fiber) t)))
-    ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
-    ;; IMPORTANT: Re-read the scheduler from the fiber struct, NOT from
-    ;; a captured variable.  The fiber may have migrated between carriers
-    ;; (via work-stealing), so the scheduler at creation time may differ
-    ;; from the current one.
-    ;; Wrapped in without-interrupts to prevent GC stop signals from
-    ;; arriving while thread state (TLS, BSP, catch/UWP) is partially
-    ;; restored — a GC during this window sees inconsistent state.
-    (sb-sys:without-interrupts
-      (setf (fiber-state fiber) :dead)
-      (let* ((scheduler (fiber-scheduler fiber))
-             (thread-sap (current-thread-sap))
-             (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
-                              sb-vm:word-shift))
-             (catch-offset (%catch-block-tls-offset))
-             (uwp-offset (%uwp-block-tls-offset))
-             (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
-             (bs-start (fiber-binding-stack-start fiber)))
-        ;; If there are remaining binding stack entries, restore carrier
-        ;; TLS values from outermost old_values (same approach as yield)
-        (when (> current-bsp bs-start)
-          (let ((bsp-sap (sb-sys:int-sap current-bsp))
-                (start-sap (sb-sys:int-sap bs-start))
-                (scratch (fiber-scheduler-tls-scratch scheduler)))
-            (clrhash scratch)
-            (let ((ptr start-sap))
-              (loop while (sb-sys:sap< ptr bsp-sap)
-                    do (let ((old-value (sb-sys:sap-ref-word ptr 0))
-                             (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
-                         (when (and (plusp tls-index)
-                                    (not (gethash tls-index scratch)))
-                           (setf (gethash tls-index scratch) t)
-                           (setf (sb-sys:sap-ref-word thread-sap tls-index)
-                                 old-value)))
-                    (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
-        ;; Update gc_info's binding-stack-pointer before restoring
-        ;; carrier BSP.  Same rationale as fiber-yield step 1c: after
-        ;; carrier BSP is set, the active_fiber_context won't cover
-        ;; the fiber's binding stack, so the gc_info must be accurate.
-        (let ((gc-info (fiber-gc-info fiber)))
-          (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
-            (sb-sys:without-gcing
-              (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes))
-                    current-bsp))))
-        ;; Restore carrier's BSP and catch/UWP blocks
-        (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
-              (fiber-scheduler-carrier-bsp scheduler))
-        (setf (sb-sys:sap-ref-word thread-sap catch-offset)
-              (fiber-scheduler-carrier-catch-block scheduler))
-        (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
-              (fiber-scheduler-carrier-unwind-protect-block scheduler))
-        ;; Switch back to scheduler
-        (%fiber-switch (fiber-saved-rsp-addr fiber)
-                      (scheduler-saved-rsp-addr scheduler)
-                      0)
-        ;; Should not reach here
-        (error "fiber-trampoline: fiber_switch returned (unreachable)")))))
+  (let ((completed-normally nil))
+    (unwind-protect
+         (handler-case
+             (let ((fn (fiber-function fiber)))
+               (when fn
+                 (setf (fiber-result fiber) (funcall fn)))
+               (setf completed-normally t))
+           (error (c)
+             (setf (fiber-result fiber) c
+                   (fiber-errorp fiber) t
+                   completed-normally t)))
+      ;; Detect cross-boundary non-local exit.  If neither the normal
+      ;; path nor the error handler completed, a RETURN-FROM or GO
+      ;; targeting a block/tag outside this fiber unwound through the
+      ;; handler-case via %unwind (which operates below the condition
+      ;; system).  Record the error so fiber-join / fiber-result can
+      ;; report it instead of silently returning NIL.
+      (unless completed-normally
+        (setf (fiber-result fiber)
+              (make-condition 'simple-error
+                              :format-control
+                              "Non-local exit (RETURN-FROM or GO) ~
+                               crossed fiber boundary in fiber ~S"
+                              :format-arguments (list (fiber-name fiber)))
+              (fiber-errorp fiber) t))
+      ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
+      ;; IMPORTANT: Re-read the scheduler from the fiber struct, NOT from
+      ;; a captured variable.  The fiber may have migrated between carriers
+      ;; (via work-stealing), so the scheduler at creation time may differ
+      ;; from the current one.
+      ;; Wrapped in without-interrupts to prevent GC stop signals from
+      ;; arriving while thread state (TLS, BSP, catch/UWP) is partially
+      ;; restored — a GC during this window sees inconsistent state.
+      (sb-sys:without-interrupts
+        (setf (fiber-state fiber) :dead)
+        (let* ((scheduler (fiber-scheduler fiber))
+               (thread-sap (current-thread-sap))
+               (bsp-offset (ash sb-vm::thread-binding-stack-pointer-slot
+                                sb-vm:word-shift))
+               (catch-offset (%catch-block-tls-offset))
+               (uwp-offset (%uwp-block-tls-offset))
+               (current-bsp (sb-sys:sap-ref-word thread-sap bsp-offset))
+               (bs-start (fiber-binding-stack-start fiber)))
+          ;; If there are remaining binding stack entries, restore carrier
+          ;; TLS values from outermost old_values (same approach as yield)
+          (when (> current-bsp bs-start)
+            (let ((bsp-sap (sb-sys:int-sap current-bsp))
+                  (start-sap (sb-sys:int-sap bs-start))
+                  (scratch (fiber-scheduler-tls-scratch scheduler)))
+              (clrhash scratch)
+              (let ((ptr start-sap))
+                (loop while (sb-sys:sap< ptr bsp-sap)
+                      do (let ((old-value (sb-sys:sap-ref-word ptr 0))
+                               (tls-index (sb-sys:sap-ref-word ptr sb-vm:n-word-bytes)))
+                           (when (and (plusp tls-index)
+                                      (not (gethash tls-index scratch)))
+                             (setf (gethash tls-index scratch) t)
+                             (setf (sb-sys:sap-ref-word thread-sap tls-index)
+                                   old-value)))
+                      (setf ptr (sb-sys:sap+ ptr (* 2 sb-vm:n-word-bytes)))))))
+          ;; Update gc_info's binding-stack-pointer before restoring
+          ;; carrier BSP.  Same rationale as fiber-yield step 1c: after
+          ;; carrier BSP is set, the active_fiber_context won't cover
+          ;; the fiber's binding stack, so the gc_info must be accurate.
+          (let ((gc-info (fiber-gc-info fiber)))
+            (unless (sb-sys:sap= gc-info (sb-sys:int-sap 0))
+              (sb-sys:without-gcing
+                (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes))
+                      current-bsp))))
+          ;; Restore carrier's BSP and catch/UWP blocks
+          (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
+                (fiber-scheduler-carrier-bsp scheduler))
+          (setf (sb-sys:sap-ref-word thread-sap catch-offset)
+                (fiber-scheduler-carrier-catch-block scheduler))
+          (setf (sb-sys:sap-ref-word thread-sap uwp-offset)
+                (fiber-scheduler-carrier-unwind-protect-block scheduler))
+          ;; Switch back to scheduler
+          (%fiber-switch (fiber-saved-rsp-addr fiber)
+                        (scheduler-saved-rsp-addr scheduler)
+                        0)
+          ;; Should not reach here
+          (error "fiber-trampoline: fiber_switch returned (unreachable)"))))))
 
 
 ;;;; ===== Register the Lisp trampoline with C =====
