@@ -43,10 +43,10 @@
 
 5. **Stack Management**
    1. Control Stack Layout and Guard Pages
-   2. Binding Stack (Separate Allocation, No Guard Page)
+   2. Binding Stack (Separate Allocation)
    3. Stack Pooling (`madvise(MADV_DONTNEED)` Recycling)
    4. Stack Overflow Detection in Signal Handlers
-   5. Stack Size Tradeoffs
+   5. Stack Size Tradeoffs (No Dynamic Growth)
 
 6. **Dynamic Variable Bindings (TLS)**
    1. The Problem: `unbind_to_here` Zeroes Entries
@@ -111,6 +111,7 @@
     4. Mutex and Condition Variable Dispatch
     5. Pinned Blocking Fallback to OS Primitives
     6. `*pinned-blocking-action*` Warning/Error Policy
+    7. `interrupt-thread`
 
 14. **Performance**
     1. HTTP Benchmark
@@ -397,6 +398,11 @@ the caller passes in.  This two-channel wake design (predicate OR
 deadline) is the building block for all higher-level waiting
 operations: mutex acquisition, condition variables, I/O waits, and
 `fiber-join`.
+
+For a pure timed wait with no wake condition, use `fiber-sleep`
+(Section 2.3) rather than `fiber-park` with a dummy predicate.
+`fiber-park` is intended for cases where you need to wait until a
+condition becomes true.
 
 ### 2.5 Fiber Join
 
@@ -1029,7 +1035,7 @@ The usable stack region is what the fiber's code sees.  RSP starts
 at `control-stack-end` (the top) and grows downward toward the guard
 page.
 
-### 5.2 Binding Stack (Separate Allocation, No Guard Page)
+### 5.2 Binding Stack (Separate Allocation)
 
 Each fiber has a separate binding stack for dynamic variable bindings.
 This is a flat array of two-word entries (old value, TLS index),
@@ -1099,7 +1105,7 @@ If the fault address falls within one guard page width below a stack's
 start, the fiber has overflowed.  The handler calls `lose()` with a
 diagnostic message including the fault address and stack boundaries.
 
-### 5.5 Stack Size Tradeoffs
+### 5.5 Stack Size Tradeoffs (No Dynamic Growth)
 
 The default control stack size of 256 KB is a compromise.  Smaller
 stacks allow more concurrent fibers (10,000 fibers at 256 KB = 2.5 GB
@@ -1113,6 +1119,16 @@ one 16-byte entry, so 16 KB supports 1024 nesting levels.  Server
 request handlers typically use a handful of special variables.
 
 Both sizes are configurable per-fiber via `make-fiber` keywords.
+
+Dynamic stack growth (as seen in Erlang/BEAM processes) is not
+supported.  Fiber stacks are fixed-size `mmap` allocations; growing
+them would require either relocating the stack (invalidating all
+interior pointers, return addresses, and GC-conservative references)
+or using discontiguous segments (requiring compiler support for
+segment-crossing checks on every function call).  Neither approach
+is feasible within SBCL's native-code compilation model.  The
+practical mitigation is to choose an appropriate stack size at
+`make-fiber` time and use heap allocation for large data structures.
 
 ## 6. Dynamic Variable Bindings (TLS)
 
@@ -1644,9 +1660,19 @@ power-of-two size, so the copy is straightforward:
                (svref old-buf (logand i old-mask))))
 ```
 
-The old buffer becomes garbage and is collected by GC.  Growth is
-rare in practice because the initial size (64) accommodates most
-workloads.
+Growth is safe because only the owner thread calls `wsd-push` (and
+therefore `wsd-grow`).  Thieves operate exclusively on `top` via
+CAS, and they index into the buffer using the current buffer
+reference and its length.  The owner publishes the new buffer via a
+single `setf` of the buffer slot; any thief that reads the old
+buffer reference before the swap sees a consistent (if stale) view
+and its CAS on `top` will fail or succeed harmlessly.  The old
+buffer becomes garbage and is collected by GC.  A write barrier
+after each push ensures the new element is visible before `bottom`
+is incremented.
+
+Growth is rare in practice because the initial size (64)
+accommodates most workloads.
 
 ### 9.5 Random Victim Selection
 
@@ -1905,8 +1931,23 @@ all other fibers on that carrier).
 
 The captured condition or return value is stored in `fiber-result`
 and can be retrieved by `fiber-join` or directly after the fiber is
-dead.  If the caller needs to distinguish normal return from error,
-it can check `(typep (fiber-result f) 'condition)`.
+dead.  Currently, `fiber-result` returns a single value, so a fiber
+that intentionally returns a condition object as its value is
+indistinguishable from one that signaled an error.  A future
+revision may return two values (result, errorp) analogous to
+`ignore-errors`.
+
+Non-local exits via `throw`, `return-from`, or `go` that target
+tags or blocks within the fiber's own function work normally --- the
+catch block and `unwind-protect` chains are saved and restored per
+fiber (see Section 6.4).  A `throw` to a tag not established within
+the fiber will signal a "tag does not exist" error (caught by the
+`handler-case`), because the fiber's catch block chain only contains
+tags established during the fiber's own execution.  Lexical non-local
+exits (`return-from`, `go`) cannot cross fiber boundaries because
+blocks and tagbodies are lexically scoped; closures that capture them
+from outside the fiber's function would target stale frames, which
+is undefined behavior (the same as for threads).
 
 ### 12.3 Binding Stack Cleanup on Death (Without `unbind_to_here`)
 
@@ -2043,6 +2084,21 @@ restructuring.  Setting it to `:error` makes pinned blocking a hard
 error (useful during development).  Setting it to `nil` silences the
 warning (appropriate for code that legitimately pins and blocks, such
 as FFI calls that hold foreign resources).
+
+### 13.7 `interrupt-thread`
+
+`interrupt-thread` is not patched for fiber awareness.  If you call
+`(sb-thread:interrupt-thread carrier-thread function)`, the function
+executes on the carrier thread in whatever context happens to be
+active at the time.  If the carrier is running a fiber, the interrupt
+function runs with that fiber's dynamic bindings and stack --- not
+the carrier's.  This is analogous to delivering a signal to an OS
+thread: the handler runs in the interrupted context.
+
+In general, `interrupt-thread` should not be used on carrier threads.
+To communicate with a fiber, use fiber-aware primitives: signal a
+condition variable, set a flag checked by a `fiber-park` predicate,
+or submit a new fiber to the scheduler group.
 
 ## 14. Performance
 
