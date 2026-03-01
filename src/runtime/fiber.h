@@ -43,6 +43,7 @@ struct fiber_gc_info {
     lispobj* control_stack_end;      /* base + size (high address) */
     lispobj* binding_stack_start;
     lispobj* binding_stack_pointer;
+    lispobj* binding_stack_end;      /* start + usable size (guard page above) */
     struct fiber_gc_info* next;
     struct fiber_gc_info* prev;
     int registered;                  /* 1 if in the GC list, 0 otherwise */
@@ -87,6 +88,7 @@ void clear_fiber_gc_context(void);
 struct fiber_stack* alloc_fiber_stack(size_t size);
 void free_fiber_stack(struct fiber_stack* stack);
 struct fiber_stack* alloc_fiber_binding_stack(size_t size);
+void free_fiber_binding_stack(struct fiber_stack* stack);
 
 /* GC registration (called from Lisp within without-gcing) */
 struct fiber_gc_info* make_fiber_gc_info(void);

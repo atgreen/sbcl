@@ -21,6 +21,9 @@
 (define-alien-routine "alloc_fiber_binding_stack"
     system-area-pointer (size unsigned-long))
 
+(define-alien-routine "free_fiber_binding_stack"
+    void (stack system-area-pointer))
+
 (define-alien-routine "make_fiber_gc_info"
     system-area-pointer)
 
@@ -594,6 +597,9 @@ MAKE-FIBER time."
              (cstack-usable-size (- cstack-total-size cstack-guard-size))
              (bstack-base (sb-sys:sap-ref-word bstack-sap 0))
              (bstack-total-size (sb-sys:sap-ref-word bstack-sap sb-vm:n-word-bytes))
+             (bstack-guard-size (sb-sys:sap-ref-word bstack-sap (* 2 sb-vm:n-word-bytes)))
+             ;; Usable binding stack: guard page is at the top (grows upward)
+             (bstack-usable-size (- bstack-total-size bstack-guard-size))
              ;; Create GC info
              (gc-info-sap (make-fiber-gc-info))
              (fiber (%make-fiber
@@ -604,7 +610,7 @@ MAKE-FIBER time."
                      :control-stack-size cstack-usable-size
                      :binding-stack-start bstack-base
                      :binding-stack-pointer bstack-base  ; empty initially
-                     :binding-stack-size bstack-total-size
+                     :binding-stack-size bstack-usable-size
                      :gc-info gc-info-sap
                      :c-control-stack cstack-sap
                      :c-binding-stack bstack-sap)))
@@ -625,7 +631,7 @@ MAKE-FIBER time."
                  fiber)
             (unless completed
               (free-fiber-gc-info gc-info-sap)
-              (free-fiber-stack bstack-sap)
+              (free-fiber-binding-stack bstack-sap)
               (free-fiber-stack cstack-sap))))))))
 
 (defun destroy-fiber (fiber)
@@ -647,7 +653,7 @@ MAKE-FIBER time."
       (setf (fiber-c-control-stack fiber) (sb-sys:int-sap 0))))
   (let ((bstack (fiber-c-binding-stack fiber)))
     (unless (sb-sys:sap= bstack (sb-sys:int-sap 0))
-      (free-fiber-stack bstack)
+      (free-fiber-binding-stack bstack)
       (setf (fiber-c-binding-stack fiber) (sb-sys:int-sap 0)))))
 
 ;;;; ===== TLS / Binding Stack Management =====
@@ -835,13 +841,16 @@ ready to be resumed."
       ;;   lispobj* control_stack_end;      // offset 16
       ;;   lispobj* binding_stack_start;    // offset 24
       ;;   lispobj* binding_stack_pointer;  // offset 32
-      ;;   ... next/prev pointers           // offset 40, 48
+      ;;   lispobj* binding_stack_end;      // offset 40
+      ;;   ... next/prev pointers           // offset 48, 56
       ;; }
       (setf (sb-sys:sap-ref-word gc-info 0) (fiber-control-stack-start fiber))
       (setf (sb-sys:sap-ref-word gc-info sb-vm:n-word-bytes) (fiber-saved-rsp fiber))
       (setf (sb-sys:sap-ref-word gc-info (* 2 sb-vm:n-word-bytes)) (fiber-control-stack-end fiber))
       (setf (sb-sys:sap-ref-word gc-info (* 3 sb-vm:n-word-bytes)) (fiber-binding-stack-start fiber))
       (setf (sb-sys:sap-ref-word gc-info (* 4 sb-vm:n-word-bytes)) (fiber-binding-stack-pointer fiber))
+      (setf (sb-sys:sap-ref-word gc-info (* 5 sb-vm:n-word-bytes))
+            (+ (fiber-binding-stack-start fiber) (fiber-binding-stack-size fiber)))
       (sb-sys:without-gcing
         (register-fiber-for-gc gc-info)))))
 
@@ -892,11 +901,29 @@ MIGRATED is true if the fiber changed carriers (work stealing)."
       ;;    boundaries and update carrier's suspended stack range.
       ;;    No mutex locks — persistent context was registered at
       ;;    scheduler start by init-carrier-fiber-context.
-      (update-fiber-gc-context
-        (fiber-control-stack-start fiber)
-        (fiber-control-stack-end fiber)
-        (fiber-binding-stack-start fiber)
-        carrier-bsp)
+      ;;    Inline the fiber field writes (always needed) and carrier BSP
+      ;;    (needed for binding stack scavenging).  The expensive C call
+      ;;    (which computes __builtin_frame_address for carrier approx_sp)
+      ;;    is only needed on migration — same-carrier resume can use the
+      ;;    stale carrier_gc_info.control_stack_pointer safely because
+      ;;    gencgc.c already scans the full carrier stack inline.
+      (let ((ctx (sb-sys:int-sap
+                   (sb-sys:sap-ref-word thread-sap
+                     (ash sb-vm::thread-fiber-context-slot sb-vm:word-shift)))))
+        (setf (sb-sys:sap-ref-word ctx (* 1 sb-vm:n-word-bytes))
+              (fiber-control-stack-start fiber))
+        (setf (sb-sys:sap-ref-word ctx (* 2 sb-vm:n-word-bytes))
+              (fiber-control-stack-end fiber))
+        (setf (sb-sys:sap-ref-word ctx (* 3 sb-vm:n-word-bytes))
+              (fiber-binding-stack-start fiber))
+        (setf (sb-sys:sap-ref-word ctx (* 8 sb-vm:n-word-bytes))
+              carrier-bsp)
+        (when migrated
+          (update-fiber-gc-context
+            (fiber-control-stack-start fiber)
+            (fiber-control-stack-end fiber)
+            (fiber-binding-stack-start fiber)
+            carrier-bsp)))
       ;; 3. Set thread BSP to fiber's binding-stack-pointer
       (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
             (fiber-binding-stack-pointer fiber))
@@ -979,8 +1006,9 @@ MIGRATED is true if the fiber changed carriers (work stealing)."
       (if (eq (fiber-state fiber) :dead)
           (unregister-fiber-gc-roots fiber)
           (register-fiber-for-gc-from-fiber fiber))
-      ;; 11. Clear fiber GC context (no mutex — just field writes)
-      (clear-fiber-gc-context)
+      ;; 11. Stale fiber GC context is harmless — GC's guard checks
+      ;;     verify ESP/BSP is within fiber range before using bounds.
+      ;;     After yield, ESP is in carrier stack so guards fail safely.
       ;; 11. Restore carrier's BSP and catch/UWP blocks
       (setf (sb-sys:sap-ref-word thread-sap bsp-offset)
             (fiber-scheduler-carrier-bsp scheduler))

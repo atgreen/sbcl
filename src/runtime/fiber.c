@@ -117,10 +117,12 @@ pool_try_alloc(struct fiber_stack **head, int *count, size_t *cached_size,
     return result;
 }
 
-/* Return a stack to pool, or deallocate if pool full / size mismatch. */
+/* Return a stack to pool, or deallocate if pool full / size mismatch.
+ * guard_at_bottom: true for control stacks (guard at low address),
+ *                  false for binding stacks (guard at high address). */
 static void
 pool_return(struct fiber_stack **head, int *count, size_t *cached_size,
-            fiber_lock_t *lock, struct fiber_stack *stack)
+            fiber_lock_t *lock, struct fiber_stack *stack, int guard_at_bottom)
 {
     ensure_pool_locks();
 
@@ -128,8 +130,17 @@ pool_return(struct fiber_stack **head, int *count, size_t *cached_size,
      * Only madvise the usable portion (skip the guard page). */
 #ifdef LISP_FEATURE_LINUX
     {
-        char *usable = (char*)stack->base + stack->guard_size;
-        size_t usable_size = stack->size - stack->guard_size;
+        char *usable;
+        size_t usable_size;
+        if (guard_at_bottom) {
+            /* Control stack: guard at bottom, usable above */
+            usable = (char*)stack->base + stack->guard_size;
+            usable_size = stack->size - stack->guard_size;
+        } else {
+            /* Binding stack: guard at top, usable below */
+            usable = (char*)stack->base;
+            usable_size = stack->size - stack->guard_size;
+        }
         if (usable_size > 0)
             madvise(usable, usable_size, MADV_DONTNEED);
     }
@@ -189,21 +200,26 @@ free_fiber_stack(struct fiber_stack* stack)
 {
     if (!stack) return;
 
-    if (stack->guard_size > 0) {
-        /* Control stack — return to control stack pool */
-        pool_return(&cstack_pool_head, &cstack_pool_count, &cstack_pool_size,
-                    &cstack_pool_lock, stack);
-    } else {
-        /* Binding stack — return to binding stack pool */
-        pool_return(&bstack_pool_head, &bstack_pool_count, &bstack_pool_size,
-                    &bstack_pool_lock, stack);
-    }
+    /* Control stack: guard page at bottom */
+    pool_return(&cstack_pool_head, &cstack_pool_count, &cstack_pool_size,
+                &cstack_pool_lock, stack, 1);
+}
+
+void
+free_fiber_binding_stack(struct fiber_stack* stack)
+{
+    if (!stack) return;
+
+    /* Binding stack: guard page at top */
+    pool_return(&bstack_pool_head, &bstack_pool_count, &bstack_pool_size,
+                &bstack_pool_lock, stack, 0);
 }
 
 struct fiber_stack*
 alloc_fiber_binding_stack(size_t size)
 {
-    size_t total = round_up_to_page(size);
+    size_t ps = os_vm_page_size;
+    size_t total = round_up_to_page(size) + ps; /* +1 page for guard at top */
 
     /* Try pool first */
     struct fiber_stack *stack = pool_try_alloc(&bstack_pool_head,
@@ -212,7 +228,6 @@ alloc_fiber_binding_stack(size_t size)
                                               &bstack_pool_lock, total);
     if (stack) return stack;
 
-    /* Binding stacks don't need a guard page - they're bounds-checked */
     stack = malloc(sizeof(struct fiber_stack));
     if (!stack) return NULL;
 
@@ -222,9 +237,12 @@ alloc_fiber_binding_stack(size_t size)
         return NULL;
     }
 
+    /* Guard page at the top (highest address) — binding stacks grow upward */
+    os_protect(mem + total - ps, ps, OS_VM_PROT_NONE);
+
     stack->base = mem;
     stack->size = total;
-    stack->guard_size = 0;
+    stack->guard_size = ps;
     stack->pool_next = NULL;
     return stack;
 }
@@ -600,6 +618,16 @@ check_fiber_guard_page(os_vm_address_t addr)
             if (addr >= guard_start && addr < (os_vm_address_t)base) {
                 lose("Fiber control stack exhausted (fault: %p, fiber stack: %p-%p)",
                      addr, base, fi->control_stack_end);
+                return 1;
+            }
+        }
+        /* Binding stack guard page is at the top (grows upward) */
+        lispobj* bs_end = fi->binding_stack_end;
+        if (bs_end) {
+            os_vm_address_t guard_start = (os_vm_address_t)bs_end;
+            if (addr >= guard_start && addr < guard_start + ps) {
+                lose("Fiber binding stack exhausted (fault: %p, binding stack: %p-%p)",
+                     addr, fi->binding_stack_start, bs_end);
                 return 1;
             }
         }
