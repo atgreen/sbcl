@@ -543,6 +543,8 @@ during backtrace.
   (effective-control-stack-start :c-type "lispobj *" :pointer t)
   #+sb-fiber
   (effective-control-stack-end :c-type "lispobj *" :pointer t)
+  #+sb-fiber
+  (fiber-context :c-type "void *" :pointer t)
   (this :c-type "struct thread *" :pointer t)
   (prev :c-type "struct thread *" :pointer t)
   (next :c-type "struct thread *" :pointer t)

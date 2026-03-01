@@ -360,17 +360,12 @@ static struct active_fiber_context* get_or_create_context(void)
     return ctx;
 }
 
-/* Find active fiber context for a thread.  Called during stop-the-world
- * GC, so no lock needed (all mutators stopped). */
+/* Find active fiber context for a thread.  O(1) via thread struct slot.
+ * Called during stop-the-world GC, so no lock needed (all mutators stopped). */
 struct active_fiber_context*
 find_active_fiber_context(struct thread* th)
 {
-    struct active_fiber_context* ctx;
-    for (ctx = all_active_fiber_contexts; ctx; ctx = ctx->next) {
-        if (ctx->carrier_thread == th)
-            return ctx;
-    }
-    return NULL;
+    return (struct active_fiber_context*)th->fiber_context;
 }
 
 void
@@ -442,6 +437,137 @@ leave_fiber_gc_context(void)
     ctx->fiber_binding_stack_start = NULL;
     ctx->next = NULL;
     ctx->prev = NULL;
+}
+
+/* ===== Persistent carrier fiber context (lock-free hot path) ===== */
+
+/*
+ * init_carrier_fiber_context() — called once when a carrier thread
+ * starts its scheduler loop.  Allocates the active_fiber_context,
+ * registers carrier_gc_info and links into all_active_fiber_contexts
+ * with one-time mutex acquisitions.  Stores the pointer in the
+ * thread struct's fiber_context slot for O(1) lookup.
+ */
+void
+init_carrier_fiber_context(void)
+{
+    ensure_active_fiber_context_lock();
+    struct active_fiber_context* ctx = get_or_create_context();
+    struct thread* th = get_sb_vm_thread();
+
+    ctx->carrier_thread = th;
+    ctx->fiber_stack_start = NULL;
+    ctx->fiber_stack_end = NULL;
+    ctx->fiber_binding_stack_start = NULL;
+
+    /* Set carrier_gc_info to empty range so GC scan loop is a no-op */
+    ctx->carrier_gc_info.control_stack_base = th->control_stack_start;
+    ctx->carrier_gc_info.control_stack_pointer = th->control_stack_end;
+    ctx->carrier_gc_info.control_stack_end = th->control_stack_end;
+    ctx->carrier_gc_info.binding_stack_start = th->binding_stack_start;
+    ctx->carrier_gc_info.binding_stack_pointer = th->binding_stack_start;
+
+    /* One-time mutex: register for GC scanning */
+    register_fiber_for_gc(&ctx->carrier_gc_info);
+
+    /* One-time mutex: link into active contexts list */
+    FIBER_LOCK(active_fiber_context_lock);
+    ctx->next = all_active_fiber_contexts;
+    ctx->prev = NULL;
+    if (all_active_fiber_contexts)
+        all_active_fiber_contexts->prev = ctx;
+    all_active_fiber_contexts = ctx;
+    FIBER_UNLOCK(active_fiber_context_lock);
+
+    /* Store in thread struct for O(1) lookup */
+    th->fiber_context = ctx;
+}
+
+/*
+ * update_fiber_gc_context() — called per resume instead of
+ * enter_fiber_gc_context.  No mutex locks, just field writes.
+ * Reads context from thread->fiber_context (no TLS lookup needed).
+ */
+void
+update_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
+                        uword_t fiber_bs_start, uword_t carrier_bsp)
+{
+    struct thread* th = get_sb_vm_thread();
+    struct active_fiber_context* ctx =
+        (struct active_fiber_context*)th->fiber_context;
+
+    ctx->fiber_stack_start = (lispobj*)fiber_stack_start;
+    ctx->fiber_stack_end = (lispobj*)fiber_stack_end;
+    ctx->fiber_binding_stack_start = (lispobj*)fiber_bs_start;
+
+    /* Update carrier stack scan range.  Use frame address minus
+     * generous buffer as conservative approximation of the carrier's
+     * eventual suspended RSP.  Clamp above guard pages. */
+    {
+        uintptr_t approx_sp = (uintptr_t)__builtin_frame_address(0) - 16384;
+        uintptr_t stack_min = (uintptr_t)th->control_stack_start
+                              + 3 * os_vm_page_size;
+        if (approx_sp < stack_min)
+            approx_sp = stack_min;
+        ctx->carrier_gc_info.control_stack_pointer = (lispobj*)approx_sp;
+    }
+    ctx->carrier_gc_info.binding_stack_pointer = (lispobj*)carrier_bsp;
+}
+
+/*
+ * clear_fiber_gc_context() — called per yield-return instead of
+ * leave_fiber_gc_context.  No mutex locks, just field clears.
+ * Sets carrier_gc_info to empty range.
+ */
+void
+clear_fiber_gc_context(void)
+{
+    struct thread* th = get_sb_vm_thread();
+    struct active_fiber_context* ctx =
+        (struct active_fiber_context*)th->fiber_context;
+    if (!ctx) return;
+
+    ctx->fiber_stack_start = NULL;
+    ctx->fiber_stack_end = NULL;
+    ctx->fiber_binding_stack_start = NULL;
+
+    /* Set carrier stack range to empty (pointer = end → zero-length scan) */
+    ctx->carrier_gc_info.control_stack_pointer =
+        ctx->carrier_gc_info.control_stack_end;
+    ctx->carrier_gc_info.binding_stack_pointer =
+        ctx->carrier_gc_info.binding_stack_start;
+}
+
+/*
+ * destroy_carrier_fiber_context() — called once when a carrier thread
+ * exits its scheduler loop.  Unregisters from GC and unlinks from
+ * all_active_fiber_contexts with one-time mutex acquisitions.
+ */
+void
+destroy_carrier_fiber_context(void)
+{
+    struct thread* th = get_sb_vm_thread();
+    struct active_fiber_context* ctx =
+        (struct active_fiber_context*)th->fiber_context;
+    if (!ctx) return;
+
+    /* One-time mutex: unregister from GC */
+    unregister_fiber_for_gc(&ctx->carrier_gc_info);
+
+    /* One-time mutex: unlink from active contexts list */
+    FIBER_LOCK(active_fiber_context_lock);
+    if (ctx->prev)
+        ctx->prev->next = ctx->next;
+    else
+        all_active_fiber_contexts = ctx->next;
+    if (ctx->next)
+        ctx->next->prev = ctx->prev;
+    FIBER_UNLOCK(active_fiber_context_lock);
+
+    ctx->carrier_thread = NULL;
+    ctx->next = NULL;
+    ctx->prev = NULL;
+    th->fiber_context = NULL;
 }
 
 /* ===== Fiber guard page detection ===== */

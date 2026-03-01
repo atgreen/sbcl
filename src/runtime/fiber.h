@@ -76,6 +76,13 @@ void enter_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
                             uword_t carrier_bs_start, uword_t carrier_bsp);
 void leave_fiber_gc_context(void);
 
+/* Persistent carrier fiber context lifecycle (lock-free hot path) */
+void init_carrier_fiber_context(void);
+void destroy_carrier_fiber_context(void);
+void update_fiber_gc_context(uword_t fiber_stack_start, uword_t fiber_stack_end,
+                             uword_t fiber_bs_start, uword_t carrier_bsp);
+void clear_fiber_gc_context(void);
+
 /* Stack allocation/deallocation */
 struct fiber_stack* alloc_fiber_stack(size_t size);
 void free_fiber_stack(struct fiber_stack* stack);
