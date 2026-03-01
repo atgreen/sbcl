@@ -168,6 +168,7 @@
   ;; Entry function and result
   (function nil :type (or null function))
   (result nil)
+  (errorp nil :type boolean)  ; T if result is from an unhandled error
   ;; Scheduling
   (carrier nil)    ; sb-thread:thread this fiber runs on
   (scheduler nil)  ; back-pointer to fiber-scheduler
@@ -1030,7 +1031,8 @@ back to the scheduler."
              (when fn
                (setf (fiber-result fiber) (funcall fn))))
          (error (c)
-           (setf (fiber-result fiber) c)))
+           (setf (fiber-result fiber) c
+                 (fiber-errorp fiber) t)))
     ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
     ;; IMPORTANT: Re-read the scheduler from the fiber struct, NOT from
     ;; a captured variable.  The fiber may have migrated between carriers
@@ -1564,6 +1566,10 @@ sentinel instead of allocating a closure."
   "Return true if the fiber has not yet finished."
   (not (eq (fiber-state fiber) :dead)))
 
+(defun fiber-error-p (fiber)
+  "Return T if the fiber terminated due to an unhandled error."
+  (fiber-errorp fiber))
+
 (declaim (inline %relative-decoded-times))
 (defun %relative-decoded-times (abs-sec abs-usec)
   "Return remaining decoded time until ABS-SEC/ABS-USEC as two values."
@@ -1618,6 +1624,8 @@ scheduler loop, avoiding a wrapper closure allocation."
 
 (defun fiber-join (target &key timeout)
   "Wait until TARGET fiber completes and return its result, or NIL on timeout.
+Returns two values: the result (or condition) and a boolean ERRORP that is T
+when the fiber terminated due to an unhandled error.
 Works from both fiber context (parks the fiber) and OS thread context
 (blocks the thread via a waitqueue)."
   (when (eq target (current-fiber))
@@ -1625,12 +1633,12 @@ Works from both fiber context (parks the fiber) and OS thread context
   (cond
     ;; Already dead — just return result
     ((eq (fiber-state target) :dead)
-     (fiber-result target))
+     (values (fiber-result target) (fiber-errorp target)))
     ;; In fiber context — park until target dies
     ((and *current-fiber* *current-scheduler*)
      (fiber-park (lambda () (eq (fiber-state target) :dead)) :timeout timeout)
      (if (eq (fiber-state target) :dead)
-         (fiber-result target)
+         (values (fiber-result target) (fiber-errorp target))
          nil))
     ;; OS thread context — spin-wait with brief sleeps
     (t
@@ -1639,7 +1647,7 @@ Works from both fiber context (parks the fiber) and OS thread context
                           (truncate (* timeout internal-time-units-per-second))))))
        (loop
          (when (eq (fiber-state target) :dead)
-           (return (fiber-result target)))
+           (return (values (fiber-result target) (fiber-errorp target))))
          (when (and deadline (>= (get-internal-real-time) deadline))
            (return nil))
          (sb-unix:nanosleep 0 1000000))))))
@@ -2075,6 +2083,7 @@ for foreign frames.  Only works for :SUSPENDED or :CREATED fibers."
           fiber-name
           fiber-state
           fiber-result
+          fiber-error-p
           fiber-alive-p
           fiber-yield
           fiber-sleep
