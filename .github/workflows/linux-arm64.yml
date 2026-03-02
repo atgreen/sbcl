@@ -18,6 +18,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v1
+    - name: generate version
+      run: echo "\"$(git rev-parse HEAD)\"" > version.lisp-expr
     - name: install host sbcl
       run: |
         sudo apt-get -qq update | true

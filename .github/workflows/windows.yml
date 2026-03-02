@@ -27,6 +27,8 @@ jobs:
         install: mingw-w64-${{matrix.env}}-gcc make diffutils git libzstd-devel
         msystem: ${{matrix.sys}}
 
+    - name: generate version
+      run: echo "\"$(git rev-parse HEAD)\"" > version.lisp-expr
     - name: install host sbcl
       shell: pwsh
       run: |
