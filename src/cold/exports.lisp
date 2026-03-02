@@ -3298,7 +3298,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "BACKTRACE" "BACKTRACE-AS-LIST"
            ;; Replaced by
 
-           "MAP-BACKTRACE" "PRINT-BACKTRACE" "LIST-BACKTRACE"))
+           "MAP-BACKTRACE" "PRINT-BACKTRACE" "LIST-BACKTRACE"
+           #+sb-fiber "PRINT-FIBER-BACKTRACE"))
 
 (defpackage "SB-DI"
   (:documentation "private: primitives used to write debuggers")

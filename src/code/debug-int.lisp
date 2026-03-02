@@ -534,23 +534,71 @@
 (defconstant known-return-p-slot (+ code-constants-offset 1))
 (defconstant cookie-slot (+ code-constants-offset 2))
 
+;;; When set, control-stack-pointer-valid-p uses these instead of the
+;;; current thread's stack bounds.  Used by fiber-top-frame to allow
+;;; the debugger to walk a fiber's stack.
+(defvar *debug-control-stack-start* nil)
+(defvar *debug-control-stack-end* nil)
+
 (declaim (inline control-stack-pointer-valid-p))
 (defun control-stack-pointer-valid-p (x &optional (aligned t))
   (declare (type system-area-pointer x))
   (let* (#-stack-grows-downward-not-upward
          (control-stack-start
-          (descriptor-sap *control-stack-start*))
+          (or *debug-control-stack-start*
+              (descriptor-sap *control-stack-start*)))
          #+stack-grows-downward-not-upward
          (control-stack-end
-          (descriptor-sap *control-stack-end*)))
+          (or *debug-control-stack-end*
+              (descriptor-sap *control-stack-end*))))
     #-stack-grows-downward-not-upward
-    (and (sap< x (current-sp))
-         (sap<= control-stack-start x)
+    (and (or *debug-control-stack-start*
+             (sap< x (current-sp))
+             ;; When running in a fiber, current-sp is on the fiber's
+             ;; mmap'd stack, not the carrier's control stack.
+             #+sb-fiber
+             (let ((eff-start (sap-ref-word
+                               (sb-thread::current-thread-sap)
+                               (ash sb-vm::thread-effective-control-stack-start-slot
+                                    sb-vm:word-shift))))
+               (and (/= eff-start (get-lisp-obj-address *control-stack-start*))
+                    (sap< x (current-sp)))))
+         (or (sap<= control-stack-start x)
+             #+sb-fiber
+             (let ((eff-start (sap-ref-word
+                               (sb-thread::current-thread-sap)
+                               (ash sb-vm::thread-effective-control-stack-start-slot
+                                    sb-vm:word-shift))))
+               (and (/= eff-start (get-lisp-obj-address *control-stack-start*))
+                    (<= eff-start (sap-int x)))))
+         ;; When both debug bounds are set (e.g. fiber walk), enforce upper bound
+         (or (not *debug-control-stack-end*)
+             (sap> *debug-control-stack-end* x))
          (or (not aligned) (zerop (logand (sap-int x)
                                           (1- (ash 1 word-shift))))))
     #+stack-grows-downward-not-upward
-    (and (sap>= x (current-sp))
-         (sap> control-stack-end x)
+    (and (or *debug-control-stack-end*
+             (sap>= x (current-sp))
+             ;; When running in a fiber, current-sp is on the fiber's
+             ;; mmap'd stack, not the carrier's control stack.
+             #+sb-fiber
+             (let ((eff-end (sap-ref-word
+                             (sb-thread::current-thread-sap)
+                             (ash sb-vm::thread-effective-control-stack-end-slot
+                                  sb-vm:word-shift))))
+               (and (/= eff-end (get-lisp-obj-address *control-stack-end*))
+                    (sap>= x (current-sp)))))
+         (or (sap> control-stack-end x)
+             #+sb-fiber
+             (let ((eff-end (sap-ref-word
+                             (sb-thread::current-thread-sap)
+                             (ash sb-vm::thread-effective-control-stack-end-slot
+                                  sb-vm:word-shift))))
+               (and (/= eff-end (get-lisp-obj-address *control-stack-end*))
+                    (< (sap-int x) eff-end))))
+         ;; When both debug bounds are set (e.g. fiber walk), enforce lower bound
+         (or (not *debug-control-stack-start*)
+             (sap<= *debug-control-stack-start* x))
          (or (not aligned) (zerop (logand (sap-int x)
                                           (1- (ash 1 word-shift))))))))
 
@@ -866,11 +914,24 @@
                   #+(or x86 x86-64)
                   (bogus-debug-fun
                    (let ((fp (frame-pointer frame)))
-                     (when (control-stack-pointer-valid-p fp)
+                     (when (and (control-stack-pointer-valid-p fp)
+                                ;; fiber_run_and_finish is the absolute bottom
+                                ;; of a fiber's call chain.  Don't try to walk
+                                ;; past it — the FP chain crosses into the
+                                ;; carrier thread's stack.
+                                #+sb-fiber
+                                (not (let ((name (bogus-debug-fun-%name debug-fun)))
+                                       (and (stringp name)
+                                            (search "fiber_run_and_finish" name)))))
                        (multiple-value-bind (ok ra ofp) (x86-call-context fp)
                          (if ok
                              (compute-calling-frame ofp ra frame)
-                             (find-saved-frame-down fp frame)))))))))
+                             ;; find-saved-frame-down walks the current thread's
+                             ;; binding stack for *saved-fp*, which is wrong when
+                             ;; inspecting a different stack (e.g. a fiber).
+                             (unless (and *debug-control-stack-start*
+                                         *debug-control-stack-end*)
+                               (find-saved-frame-down fp frame))))))))))
         down)))
 
 (defun foreign-function-backtrace-name (sap)
@@ -4161,3 +4222,55 @@ register."
                 (flush-frames-above caller)
                 (return caller)))))
       ((or error debug-condition) ()))))
+
+;;;; ===== Fiber debug support =====
+
+#+sb-fiber
+(defmacro with-fiber-debug-bounds ((fiber) &body body)
+  "Bind *DEBUG-CONTROL-STACK-START/END* to FIBER's stack bounds.
+Use this around fiber-top-frame + frame-down walks for suspended fibers."
+  (let ((f (gensym "FIBER")))
+    `(let* ((,f ,fiber)
+            (*debug-control-stack-start*
+             (int-sap (sb-thread::fiber-control-stack-start ,f)))
+            (*debug-control-stack-end*
+             (int-sap (sb-thread::fiber-control-stack-end ,f))))
+       ,@body)))
+
+#+sb-fiber
+(defun fiber-top-frame (fiber)
+  "Return the top debugger frame for a suspended fiber.
+Callers should wrap this in WITH-FIBER-DEBUG-BOUNDS so that
+frame-down walks also see the fiber's stack bounds."
+  (let* ((saved-rsp (sb-thread::fiber-saved-rsp fiber))
+         ;; Extract FP and PC from the fiber-switch save area
+         ;; (architecture-specific offsets)
+         (fp-val #+(and x86-64 (not win32))
+                 (sap-ref-word (int-sap saved-rsp) 40)
+                 #+(and x86-64 win32)
+                 (sap-ref-word (int-sap saved-rsp) 56)
+                 #+arm64
+                 (sap-ref-word (int-sap saved-rsp) 0)
+                 #+arm
+                 (sap-ref-32 (int-sap saved-rsp) 96)
+                 #+ppc64
+                 (sap-ref-word (int-sap saved-rsp) 32)
+                 #+ppc
+                 (sap-ref-32 (int-sap saved-rsp) 16)
+                 #+riscv
+                 (sap-ref-word (int-sap saved-rsp) 8))
+         (pc-val #+(and x86-64 (not win32))
+                 (sap-ref-word (int-sap saved-rsp) 48)
+                 #+(and x86-64 win32)
+                 (sap-ref-word (int-sap saved-rsp) 64)
+                 #+arm64
+                 (sap-ref-word (int-sap saved-rsp) 8)
+                 #+arm
+                 (sap-ref-32 (int-sap saved-rsp) 100)
+                 #+ppc64
+                 (sap-ref-word (int-sap saved-rsp) 8)
+                 #+ppc
+                 (sap-ref-32 (int-sap saved-rsp) 4)
+                 #+riscv
+                 (sap-ref-word (int-sap saved-rsp) 0)))
+    (compute-calling-frame (int-sap fp-val) (int-sap pc-val) nil)))

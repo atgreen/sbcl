@@ -710,6 +710,17 @@ possible while navigating and ignoring possible errors."
       (fresh-line stream)
       (values))))
 
+#+sb-fiber
+(defun print-fiber-backtrace (fiber &rest args
+                              &key (stream *debug-io*) (count *backtrace-frame-count*)
+                              &allow-other-keys)
+  "Print a backtrace for a suspended fiber."
+  (declare (ignore stream count))
+  (sb-di::with-fiber-debug-bounds (fiber)
+    (let ((frame (sb-di::fiber-top-frame fiber)))
+      (when frame
+        (apply #'print-backtrace :from frame args)))))
+
 (defun list-backtrace (&key
                        (count *backtrace-frame-count*)
                        (argument-limit *default-argument-limit*)
@@ -801,6 +812,22 @@ information."
     (and (sb-vm:is-lisp-pointer a)
          (cond ((and (<= (get-lisp-obj-address sb-vm:*control-stack-start*) a)
                      (< a (get-lisp-obj-address sb-vm:*control-stack-end*)))
+                sb-thread:*current-thread*)
+               ;; When running in a fiber, RSP is in the fiber's mmap'd stack,
+               ;; not the carrier thread's control stack.  Check the
+               ;; per-thread effective stack bounds (set by fiber resume).
+               #+sb-fiber
+               ((let ((eff-start (sb-sys:sap-ref-word
+                                  (sb-thread::current-thread-sap)
+                                  (ash sb-vm::thread-effective-control-stack-start-slot
+                                       sb-vm:word-shift)))
+                      (eff-end (sb-sys:sap-ref-word
+                                (sb-thread::current-thread-sap)
+                                (ash sb-vm::thread-effective-control-stack-end-slot
+                                     sb-vm:word-shift))))
+                  (and (/= eff-start (get-lisp-obj-address sb-vm:*control-stack-start*))
+                       (<= eff-start a)
+                       (< a eff-end)))
                 sb-thread:*current-thread*)
                (all-threads
                 ;; There aren't many reasons to inquire whether a random object is on any stack.
@@ -2023,6 +2050,32 @@ forms that explicitly control this kind of evaluation.")
 
 (!def-debug-command "BACKTRACE" ()
  (print-backtrace :count (read-if-available most-positive-fixnum)))
+
+#+sb-fiber
+(!def-debug-command "FIBER" ()
+  (let* ((index (read-if-available nil))
+         (fibers (funcall 'sb-thread::list-all-fibers))
+         (fiber (if index
+                    (nth index fibers)
+                    (progn
+                      (format *debug-io* "~&Fibers:~%")
+                      (loop for f in fibers
+                            for i from 0
+                            do (format *debug-io* "  ~D: ~A~%" i f))
+                      (format *debug-io* "~&Select fiber: ")
+                      (force-output *debug-io*)
+                      (nth (read *debug-io*) fibers)))))
+    (when fiber
+      (unless (member (sb-thread::fiber-state fiber) '(:suspended :created))
+        (format *debug-io* "~&Can only inspect suspended/created fibers.~%")
+        (return-from fiber-debug-command))
+      (sb-di::with-fiber-debug-bounds (fiber)
+        (let ((frame (sb-di::fiber-top-frame fiber)))
+          (if frame
+              (progn
+                (setf *current-frame* frame)
+                (print-frame-call frame *debug-io*))
+              (format *debug-io* "~&Could not get fiber frame.~%")))))))
 
 (!def-debug-command "PRINT" ()
   (print-frame-call *current-frame* *debug-io*))
