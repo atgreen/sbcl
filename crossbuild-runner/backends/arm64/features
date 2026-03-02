@@ -6,3 +6,4 @@
 :unwind-to-frame-and-call-vop
 :call-symbol
 :no-continue-unwind
+:sb-fiber

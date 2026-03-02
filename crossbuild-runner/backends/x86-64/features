@@ -17,3 +17,4 @@
 :executable-funinstances
 :unbind-in-unwind
 :no-continue-unwind
+:sb-fiber
