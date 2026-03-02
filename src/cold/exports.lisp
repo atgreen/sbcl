@@ -1334,6 +1334,14 @@ interface stability.")
    "POLLFD" "POLLIN" "POLLOUT" "POLLHUP" "POLLNVAL" "POLLERR"
    "FD" "EVENTS" "REVENTS"
    "FD-ISSET" "FD-SET" "UNIX-FAST-SELECT"
+
+   ;; epoll (Linux)
+   "EPOLL-CREATE1" "EPOLL-CTL-ADD" "EPOLL-CTL-MOD" "EPOLL-CTL-DEL"
+   "EPOLL-WAIT" "EPOLLIN" "EPOLLOUT" "EPOLLERR" "EPOLLHUP" "EPOLLET" "EPOLLONESHOT"
+
+   ;; kqueue (BSD)
+   "KQUEUE" "KEVENT" "EVFILT-READ" "EVFILT-WRITE"
+   "EV-ADD" "EV-DELETE" "EV-ENABLE"
    "PTHREAD-KILL" "RAISE" "UNIX-KILL" "UNIX-KILLPG"
    "FD-ZERO" "FD-CLR"
    "FD-SETSIZE"))
@@ -3452,7 +3460,35 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "CLEAR-SEMAPHORE-NOTIFICATION"
            "MAKE-SEMAPHORE-NOTIFICATION"
            "SEMAPHORE-NOTIFICATION"
-           "SEMAPHORE-NOTIFICATION-STATUS"))
+           "SEMAPHORE-NOTIFICATION-STATUS"
+           ;; Fibers (virtual threads)
+
+           "*CURRENT-FIBER*"
+           "*CURRENT-SCHEDULER*"
+           "CURRENT-FIBER"
+           "FIBER"
+           "FIBER-ALIVE-P"
+           "FIBER-CAN-YIELD-P"
+           "FIBER-GET-BACKTRACE"
+           "FIBER-GROUP-DONE-P"
+           "FIBER-JOIN"
+           "FIBER-NAME"
+           "FIBER-PARK"
+           "FIBER-PIN"
+           "FIBER-RESULT"
+           "FIBER-SCHEDULER-GROUP"
+           "FIBER-SLEEP"
+           "FIBER-STATE"
+           "FIBER-UNPIN"
+           "FIBER-YIELD"
+           "FINISH-FIBERS"
+           "LIST-ALL-FIBERS"
+           "MAKE-FIBER"
+           "RUN-FIBERS"
+           "START-FIBERS"
+           "SUBMIT-FIBER"
+           "WITH-FIBER-PINNED"
+           "*PINNED-BLOCKING-ACTION*"))
 
 (defpackage "SB-WALKER"
   (:documentation "internal: a code walker used by PCL")

@@ -49,6 +49,10 @@
   ;; If adding slots between TOKEN and NAME, please see futex_name() in linux_os.c
   ;; which attempts to divine a string from a futex word address.
   (name nil :type (or null string))
+  ;; Generation counter for fiber-aware condition variables.
+  ;; Incremented by CONDITION-NOTIFY; fiber waiters check for change.
+  #+sb-fiber
+  (fiber-generation 0 :type sb-ext:word)
   ;; For WITH-CAS-LOCK: because CONDITION-WAIT must be able to call
   ;; %WAITQUEUE-WAKEUP without re-aquiring the mutex, we need a separate
   ;; lock. In most cases this should be uncontested thanks to the mutex --
@@ -212,3 +216,10 @@ temporarily.")
 (progn
   (defvar *current-thread*)
   (declaim (type thread *current-thread*)))
+
+;; Fiber context variables (declared early so serve-event.lisp can check them;
+;; fiber.lisp provides the actual implementation)
+#+sb-fiber
+(defvar *current-fiber* nil)
+#+sb-fiber
+(defvar *current-scheduler* nil)
