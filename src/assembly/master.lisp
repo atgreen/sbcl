@@ -4,4 +4,5 @@
         "src/assembly/{arch}/assem-rtns"
         "src/assembly/{arch}/array"
         "src/assembly/{arch}/arith"
-        "src/assembly/{arch}/alloc"))
+        "src/assembly/{arch}/alloc"
+        #+sb-fiber "src/assembly/{arch}/fiber"))
