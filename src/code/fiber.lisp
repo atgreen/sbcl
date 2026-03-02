@@ -1588,3 +1588,533 @@ fibers have completed."
           (sb-unix:unix-close efd)
           (setf (fiber-scheduler-event-fd scheduler) -1))))))
 
+;;;; ===== Convenience API =====
+
+(defun %always-false () nil)
+
+(defun fiber-sleep (seconds)
+  "Sleep the current fiber for SECONDS (can be fractional).
+Only works within a fiber context.  Uses the deadline slot and a global
+sentinel instead of allocating a closure."
+  (let ((deadline (+ (get-internal-real-time)
+                     (truncate (* seconds internal-time-units-per-second)))))
+    (setf (fiber-deadline *current-fiber*) deadline)
+    (fiber-yield nil)
+    (setf (fiber-deadline *current-fiber*) nil)))
+
+(defun %fiber-sleep (seconds)
+  "Fiber dispatch for CL:SLEEP. Returns :PINNED-FALL-THROUGH if pinned."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'sleep)
+    (return-from %fiber-sleep :pinned-fall-through))
+  (fiber-sleep seconds)
+  nil)
+
+(defun %fiber-wait-for (test stop-sec stop-usec)
+  "Fiber dispatch for SB-EXT:WAIT-FOR. Returns :PINNED-FALL-THROUGH if pinned."
+  (declare (function test))
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'wait-for)
+    (return-from %fiber-wait-for :pinned-fall-through))
+  (let ((timeout
+          (when stop-sec
+            (let ((remaining-usec
+                    (- (+ (* 1000000 stop-sec) stop-usec)
+                       (multiple-value-bind (sec usec)
+                           (decode-internal-time (get-internal-real-time))
+                         (+ (* 1000000 sec) usec)))))
+              (when (plusp remaining-usec)
+                (/ remaining-usec 1000000.0d0))))))
+    (if (and timeout (not (plusp timeout)))
+        nil  ; already timed out
+        (fiber-park test :timeout timeout))))
+
+(defun fiber-alive-p (fiber)
+  "Return true if the fiber has not yet finished."
+  (not (eq (fiber-state fiber) :dead)))
+
+(defun fiber-error-p (fiber)
+  "Return T if the fiber terminated due to an unhandled error."
+  (fiber-errorp fiber))
+
+(declaim (inline %relative-decoded-times))
+(defun %relative-decoded-times (abs-sec abs-usec)
+  "Return remaining decoded time until ABS-SEC/ABS-USEC as two values."
+  (multiple-value-bind (now-sec now-usec)
+      (decode-internal-time (get-internal-real-time))
+    (let ((remaining-usec (- (+ (* 1000000 abs-sec) abs-usec)
+                             (+ (* 1000000 now-sec) now-usec))))
+      (if (plusp remaining-usec)
+          (values (truncate remaining-usec 1000000)
+                  (mod remaining-usec 1000000))
+          (values 0 0)))))
+
+;;;; ===== Pinned-blocking check =====
+
+(defvar *pinned-blocking-action* :warn
+  "Action when a pinned fiber hits a blocking primitive.
+:WARN emits a warning, :ERROR signals an error, NIL does nothing.")
+
+(defun check-pinned-blocking (operation)
+  "Check-and-signal when a pinned fiber attempts to block on OPERATION."
+  (let ((fiber *current-fiber*))
+    (case *pinned-blocking-action*
+      (:warn  (warn "Fiber ~A is pinned, blocking carrier on ~A"
+                    (fiber-name fiber) operation))
+      (:error (error "Fiber ~A is pinned, cannot yield for ~A"
+                     (fiber-name fiber) operation)))))
+
+;;;; ===== fiber-park: general-purpose park with timeout =====
+
+(defun fiber-park (predicate &key timeout)
+  "Park current fiber until PREDICATE returns true or TIMEOUT (seconds) expires.
+Returns T if predicate satisfied, NIL on timeout.  Passes the raw predicate
+to fiber-yield; deadline is stored in the fiber struct and checked by the
+scheduler loop, avoiding a wrapper closure allocation."
+  (let ((deadline (when timeout
+                    (+ (get-internal-real-time)
+                       (truncate (* timeout internal-time-units-per-second))))))
+    ;; Store deadline in fiber struct for scheduler fast-path checking
+    (when deadline
+      (setf (fiber-deadline *current-fiber*) deadline))
+    (fiber-yield predicate)
+    ;; Clear deadline after wake
+    (when deadline
+      (setf (fiber-deadline *current-fiber*) nil))
+    ;; After wake: check which condition triggered
+    (if (and deadline (>= (get-internal-real-time) deadline)
+             (not (funcall predicate)))
+        nil   ; timeout
+        t)))  ; predicate satisfied
+
+;;;; ===== fiber-join =====
+
+(defun fiber-join (target &key timeout)
+  "Wait until TARGET fiber completes and return its result, or NIL on timeout.
+Returns two values: the result (or condition) and a boolean ERRORP that is T
+when the fiber terminated due to an unhandled error.
+Works from both fiber context (parks the fiber) and OS thread context
+(blocks the thread via a waitqueue)."
+  (when (eq target (current-fiber))
+    (error "Fiber cannot join itself"))
+  (cond
+    ;; Already dead — just return result
+    ((eq (fiber-state target) :dead)
+     (values (fiber-result target) (fiber-errorp target)))
+    ;; In fiber context — park until target dies
+    ((and *current-fiber* *current-scheduler*)
+     (fiber-park (lambda () (eq (fiber-state target) :dead)) :timeout timeout)
+     (if (eq (fiber-state target) :dead)
+         (values (fiber-result target) (fiber-errorp target))
+         nil))
+    ;; OS thread context — spin-wait with brief sleeps
+    (t
+     (let ((deadline (when timeout
+                       (+ (get-internal-real-time)
+                          (truncate (* timeout internal-time-units-per-second))))))
+       (loop
+         (when (eq (fiber-state target) :dead)
+           (return (values (fiber-result target) (fiber-errorp target))))
+         (when (and deadline (>= (get-internal-real-time) deadline))
+           (return nil))
+         (sb-unix:nanosleep 0 1000000))))))
+
+;;;; ===== Fiber-aware threading primitives =====
+
+(defun %fiber-condition-wait (queue mutex timeout stop-sec stop-usec)
+  "Fiber-aware condition-wait. Release MUTEX, park fiber until notified,
+re-acquire MUTEX. Returns T (or multiple values with remaining time)
+on success, NIL on timeout. Returns :PINNED-FALL-THROUGH when fiber
+is pinned (caller should use the OS blocking path)."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'condition-wait)
+    (return-from %fiber-condition-wait :pinned-fall-through))
+  (let ((gen (waitqueue-fiber-generation queue)))
+    (release-mutex mutex)
+    (let ((notified (fiber-park
+                     (lambda () (/= (waitqueue-fiber-generation queue) gen))
+                     :timeout timeout)))
+      (if (not notified)
+          nil  ; timeout during wait
+          ;; Notified -- re-acquire mutex with remaining time
+          (let ((remaining-secs
+                  (when stop-sec
+                    (multiple-value-bind (sec usec)
+                        (%relative-decoded-times stop-sec stop-usec)
+                      (when (and (zerop sec) (not (plusp usec)))
+                        (return-from %fiber-condition-wait nil))
+                      (+ sec (/ usec 1000000.0d0))))))
+            (unless (or (%try-mutex mutex)
+                        (%fiber-grab-mutex-internal mutex remaining-secs))
+              (return-from %fiber-condition-wait nil))
+            ;; Success: return T, or (values T remaining-sec remaining-usec)
+            (if stop-sec
+                (multiple-value-bind (sec usec)
+                    (%relative-decoded-times stop-sec stop-usec)
+                  (values t sec usec))
+                t))))))
+
+(defun %fiber-grab-mutex-internal (mutex timeout)
+  "Internal fiber-aware mutex acquisition (no pin check).
+Returns T on success, NIL on timeout."
+  (let ((pred (lambda ()
+                #+sb-futex (eql (mutex-state mutex) 0)
+                #-sb-futex (eql (mutex-%owner mutex) 0))))
+    (loop
+      (let ((ok (fiber-park pred :timeout timeout)))
+        (unless ok (return nil))           ; timeout
+        (when (%try-mutex mutex) (return t))))))
+
+(defun %fiber-grab-mutex (mutex timeout)
+  "Fiber-aware mutex acquisition. Yield until mutex is free, then CAS.
+Returns T on success, NIL on timeout. Returns :PINNED-FALL-THROUGH
+when fiber is pinned (caller should use the OS blocking path)."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'grab-mutex)
+    (return-from %fiber-grab-mutex :pinned-fall-through))
+  (%fiber-grab-mutex-internal mutex timeout))
+
+;;;; ===== Fiber-aware I/O =====
+
+(defun fd-ready-p (fd direction)
+  "Non-blocking check: is FD usable for DIRECTION (:input or :output)?"
+  #+win32
+  (if (eq direction :output)
+      t  ; Windows always reports output as ready
+      (sb-win32:handle-listen fd 0 0))
+  #-win32
+  (sb-unix:unix-simple-poll fd direction 0))
+
+(defun %fiber-wait-until-fd-usable (fd direction timeout)
+  "Fiber-aware fd wait. Park fiber until FD is usable for DIRECTION.
+Returns T on success, NIL on timeout. Returns :PINNED-FALL-THROUGH
+when fiber is pinned."
+  (unless (fiber-can-yield-p)
+    (check-pinned-blocking 'wait-until-fd-usable)
+    (return-from %fiber-wait-until-fd-usable :pinned-fall-through))
+  ;; Keep timeout=0 behavior non-blocking.
+  (when (and timeout (not (plusp timeout)))
+    (return-from %fiber-wait-until-fd-usable
+      #+linux
+      (let ((scheduler *current-scheduler*))
+        (if (and scheduler
+                 (not (minusp (fiber-scheduler-event-fd scheduler)))
+                 (gethash fd (fiber-scheduler-ready-fds scheduler)))
+            t
+            (fd-ready-p fd direction)))
+      #-linux
+      (fd-ready-p fd direction)))
+  ;; Park with fd-readiness wait-info, using epoll-driven wake when available.
+  (let ((fiber *current-fiber*)
+        (scheduler *current-scheduler*))
+    (setf (fiber-wait-fd fiber) fd
+          (fiber-wait-direction fiber) direction)
+    (%event-register scheduler fd direction)
+    (unwind-protect
+         #+linux
+         (if (not (minusp (fiber-scheduler-event-fd scheduler)))
+             ;; With epoll, avoid per-wake poll() checks and rely on scheduler
+             ;; wakeup + optional deadline handling.
+             (let ((deadline (when timeout
+                               (+ (get-internal-real-time)
+                                  (truncate (* timeout
+                                               internal-time-units-per-second))))))
+               (when deadline
+                 (setf (fiber-deadline fiber) deadline))
+               (fiber-yield #'%always-false)
+               (when deadline
+                 (setf (fiber-deadline fiber) nil))
+               (if (and deadline
+                        (>= (get-internal-real-time) deadline)
+                        (not (fd-ready-p fd direction)))
+                   nil
+                   t))
+             (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
+                                       :timeout timeout)))
+               (if result t nil)))
+         #-linux
+         (let ((result (fiber-park (lambda () (fd-ready-p fd direction))
+                                   :timeout timeout)))
+           (if result t nil))
+      (setf (fiber-wait-fd fiber) -1))))
+
+;;;; ===== Event multiplexer registration (epoll/kqueue) =====
+
+#+(or linux bsd)
+(defun %event-register (scheduler fd direction)
+  "Register fd/direction with the scheduler's event multiplexer."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (when (minusp efd) (return-from %event-register))
+    #+linux
+    (let* ((table (fiber-scheduler-registered-fds scheduler))
+           (events (logior (if (eq direction :input)
+                               sb-unix:epollin sb-unix:epollout)
+                           sb-unix:epollet
+                           sb-unix:epolloneshot))
+           (current (gethash fd table 0)))
+      (if (zerop current)
+          (sb-unix:epoll-ctl-add efd fd events)
+          ;; Re-arm: EPOLLONESHOT disables after one event, MOD re-enables.
+          ;; If the fd was closed and reopened, the kernel removed the old
+          ;; registration but our table still has a stale entry.  Detect
+          ;; ENOENT from MOD and retry with ADD.
+          (unless (sb-unix:epoll-ctl-mod efd fd events)
+            (sb-unix:epoll-ctl-add efd fd events)))
+      (setf (gethash fd table) events))
+    #+bsd
+    (%kqueue-register efd fd direction :add)))
+
+#+(or linux bsd)
+(defun %event-deregister (scheduler fd direction)
+  "Deregister fd/direction from the scheduler's event multiplexer."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (when (minusp efd) (return-from %event-deregister))
+    #+linux
+    (let* ((table (fiber-scheduler-registered-fds scheduler))
+           (remove-events (if (eq direction :input)
+                              sb-unix:epollin sb-unix:epollout))
+           (current (gethash fd table 0))
+           (remaining (logandc2 current remove-events)))
+      ;; Check if any direction bits remain (ignore flag bits like EPOLLET)
+      (if (zerop (logand remaining (logior sb-unix:epollin sb-unix:epollout)))
+          (progn (sb-unix:epoll-ctl-del efd fd)
+                 (remhash fd table))
+          (progn (sb-unix:epoll-ctl-mod efd fd remaining)
+                 (setf (gethash fd table) remaining))))
+    #+bsd
+    (%kqueue-register efd fd direction :delete)))
+
+#-(or linux bsd)
+(defun %event-register (scheduler fd direction)
+  (declare (ignore scheduler fd direction)))
+#-(or linux bsd)
+(defun %event-deregister (scheduler fd direction)
+  (declare (ignore scheduler fd direction)))
+
+#+bsd
+(defun %kqueue-register (kq fd direction action)
+  "Add or delete a kevent filter for fd."
+  (let ((filter (if (eq direction :input)
+                    sb-unix:evfilt-read
+                    sb-unix:evfilt-write))
+        (flags (if (eq action :add)
+                   (logior sb-unix:ev-add sb-unix:ev-enable)
+                   sb-unix:ev-delete)))
+    (with-alien ((kev (struct sb-unix:kevent)))
+      (setf (slot kev 'sb-unix::ident) fd
+            (slot kev 'sb-unix::filter) filter
+            (slot kev 'sb-unix::flags) flags
+            (slot kev 'sb-unix::fflags) 0
+            (slot kev 'sb-unix::data) 0
+            (slot kev 'sb-unix::udata) 0)
+      ;; Register change, don't wait for events (nevents=0)
+      (sb-unix:kevent kq (alien-sap (addr kev)) 1
+                      (int-sap 0) 0 (int-sap 0)))))
+
+;;;; ===== Efficient Idle Hook (batched I/O polling) =====
+
+(defun compute-nearest-deadline (scheduler)
+  "Return nearest deadline in milliseconds from the deadline heap, or NIL."
+  (let ((count (fiber-scheduler-deadline-heap-count scheduler)))
+    (when (plusp count)
+      (let* ((fiber (svref (fiber-scheduler-deadline-heap scheduler) 0))
+             (dl (fiber-deadline fiber))
+             (now (get-internal-real-time)))
+        (max 1 (truncate (* 1000 (max 0 (- dl now)))
+                         internal-time-units-per-second))))))
+
+;;; Shared fallback: register temporary handlers and call serve-event.
+#-win32
+(defun %batched-fd-poll/serve-event (scheduler timeout-ms)
+  "Fallback: register temporary handlers and call serve-event."
+  (let ((handlers nil)
+        (timeout-sec (/ timeout-ms 1000.0d0)))
+    (unwind-protect
+         (progn
+           (loop for f = (fiber-scheduler-waiting scheduler) then (fiber-next-waiting f)
+                 while f do
+             (let ((wait-fd (fiber-wait-fd f)))
+               (when (>= wait-fd 0)
+                 (push (add-fd-handler
+                        wait-fd
+                        (fiber-wait-direction f)
+                        (lambda (fd) (declare (ignore fd))))
+                       handlers))))
+           (when handlers
+             (serve-event timeout-sec)))
+      (dolist (h handlers)
+        (remove-fd-handler h)))))
+
+;;; Platform-specific %batched-fd-poll implementations
+#+linux
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Wait for I/O events using epoll, falling back to serve-event.
+Populates the scheduler's ready-fds table and wakes io-waiters so
+the caller (idle hook) can return to the scheduler loop with fibers
+already in the run deque."
+  (let ((efd (fiber-scheduler-event-fd scheduler)))
+    (if (minusp efd)
+        (%batched-fd-poll/serve-event scheduler timeout-ms)
+        (progn
+          (%scheduler-harvest-epoll scheduler (min timeout-ms 1000))
+          (when (plusp (fiber-scheduler-io-waiter-count scheduler))
+            (%scheduler-wake-ready-io-waiters
+             scheduler (fiber-scheduler-run-deque scheduler)))))))
+
+#+bsd
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Wait for I/O events using kqueue, falling back to serve-event."
+  (let ((kq (fiber-scheduler-event-fd scheduler)))
+    (if (minusp kq)
+        (%batched-fd-poll/serve-event scheduler timeout-ms)
+        (with-alien ((timeout (struct sb-unix::timespec)))
+          (let ((sec (truncate timeout-ms 1000))
+                (nsec (* (mod timeout-ms 1000) 1000000)))
+            (setf (slot timeout 'sb-unix::tv-sec) sec
+                  (slot timeout 'sb-unix::tv-nsec) nsec)
+            (with-alien ((events (array (struct sb-unix:kevent) 64)))
+              (sb-unix:kevent kq (int-sap 0) 0
+                              (alien-sap (addr events)) 64
+                              (alien-sap (addr timeout)))))))))
+
+#-(or linux bsd win32)
+(defun %batched-fd-poll (scheduler timeout-ms)
+  (%batched-fd-poll/serve-event scheduler timeout-ms))
+
+#+win32
+(defun %batched-fd-poll (scheduler timeout-ms)
+  "Poll each waiting fiber's fd on Windows."
+  (let ((any-ready nil))
+    (loop for f = (fiber-scheduler-waiting scheduler) then (fiber-next-waiting f)
+          while f do
+      (let ((wait-fd (fiber-wait-fd f)))
+        (when (and (>= wait-fd 0)
+                   (fd-ready-p wait-fd (fiber-wait-direction f)))
+          (setf any-ready t))))
+    (unless any-ready
+      (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000)))))
+
+(defun fiber-io-idle-hook (scheduler)
+  "Idle hook that polls fds from waiting fibers using a single poll/select call.
+Called when no fibers are runnable but some are waiting."
+  (let ((timeout-ms (or (compute-nearest-deadline scheduler) 100))
+        #+linux
+        (has-io-waiters (plusp (fiber-scheduler-io-waiter-count scheduler)))
+        #-linux
+        (has-io-waiters nil))
+    ;; Check if any waiting fibers have I/O wait info
+    (loop for f = (fiber-scheduler-waiting scheduler) then (fiber-next-waiting f)
+          while f do
+      (when (>= (fiber-wait-fd f) 0)
+        (setf has-io-waiters t)
+        (return)))
+    (if has-io-waiters
+        (%batched-fd-poll scheduler timeout-ms)
+        ;; No I/O waiters; sleep briefly for timer-based waits
+        (sb-unix:nanosleep 0 (* (min timeout-ms 10) 1000000)))))
+
+;;;; ===== Multi-carrier scheduling =====
+
+(defun %default-carrier-count ()
+  "Return the number of available CPUs, respecting cgroup limits on Linux."
+  (let ((online
+          #+win32
+          (deref (extern-alien "os_number_of_processors" int))
+          #-win32
+          (alien-funcall
+           (extern-alien "sysconf" (function long int))
+           #+linux 84    ; _SC_NPROCESSORS_ONLN
+           #+darwin 58   ; _SC_NPROCESSORS_ONLN on macOS
+           #-(or linux darwin) 84)))
+    (when (< online 1) (setf online 1))
+    #+linux
+    (let ((cgroup (sb-sys::%cgroup-effective-cpus)))
+      (when cgroup
+        (setf online (min online cgroup))))
+    (max 1 online)))
+
+(defun start-fibers (fibers &key (carrier-count (%default-carrier-count)) idle-hook)
+  "Start FIBERS across CARRIER-COUNT background carrier threads.
+Returns a FIBER-SCHEDULER-GROUP handle immediately.  All carriers run on
+background threads (even when CARRIER-COUNT is 1).  Use FINISH-FIBERS to
+join the carriers and collect results, or FIBER-GROUP-DONE-P to poll."
+  (let ((fibers (coerce fibers 'list)))
+    (when (null fibers) (return-from start-fibers nil))
+    (let* ((schedulers (loop repeat carrier-count
+                             collect (make-fiber-scheduler :idle-hook idle-hook)))
+           (sched-vec (coerce schedulers 'simple-vector))
+           (group (%make-fiber-scheduler-group
+                   :schedulers sched-vec
+                   :active-count (length fibers)
+                   :fibers fibers)))
+      ;; Link schedulers to group
+      (loop for s across sched-vec
+            for i from 0
+            do (setf (fiber-scheduler-group s) group
+                     (fiber-scheduler-index s) i))
+      ;; Distribute fibers round-robin
+      (loop for f in fibers
+            for i from 0
+            do (submit-fiber (aref sched-vec (mod i carrier-count)) f))
+      ;; Spawn ALL carriers as background threads
+      (let ((threads nil))
+        (dolist (sched schedulers)
+          (push (make-thread (lambda () (run-fiber-scheduler sched))
+                             :name "fiber-carrier")
+                threads))
+        (setf (fsg-threads group) (nreverse threads)))
+      group)))
+
+(defun finish-fibers (group)
+  "Join all carrier threads in GROUP and return a list of fiber results.
+Blocks until all fibers have completed."
+  (when (null group) (return-from finish-fibers nil))
+  ;; Mark group closed so submit-fiber rejects late submissions
+  (setf (fsg-closed-p group) t)
+  (dolist (th (fsg-threads group))
+    (join-thread th))
+  (mapcar #'fiber-result (fsg-fibers group)))
+
+(defun fiber-group-done-p (group)
+  "Return T if all fibers in GROUP have completed (non-blocking check)."
+  (if (null group)
+      t
+      (zerop (the fixnum (fsg-active-count group)))))
+
+(defun run-fibers (fibers &key (carrier-count (%default-carrier-count)) idle-hook)
+  "Run FIBERS across CARRIER-COUNT carrier threads.  Returns a list of
+fiber results when all fibers have completed.
+Convenience wrapper around START-FIBERS + FINISH-FIBERS."
+  (if (null fibers)
+      nil
+      (finish-fibers (start-fibers fibers :carrier-count carrier-count
+                                          :idle-hook idle-hook))))
+
+;;;; ===== Exports =====
+
+(export '(make-fiber
+          fiber
+          fiber-name
+          fiber-state
+          fiber-result
+          fiber-error-p
+          fiber-alive-p
+          fiber-yield
+          fiber-sleep
+          fiber-park
+          fiber-join
+          fiber-pin
+          fiber-unpin
+          fiber-can-yield-p
+          with-fiber-pinned
+          *pinned-blocking-action*
+          current-fiber
+          submit-fiber
+          run-fibers
+          start-fibers
+          finish-fibers
+          fiber-group-done-p
+          fiber-scheduler-group
+          *current-fiber*
+          *current-scheduler*
+          list-all-fibers))

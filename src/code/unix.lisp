@@ -671,6 +671,50 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
                     (logtest pollhup revents)))
               (error "Syscall poll(2) failed: ~A" (strerror))))))))
 
+;;;; epoll (Linux)
+#+linux
+(progn
+  (declaim (inline epoll-create1))
+  (defun epoll-create1 (flags)
+    (int-syscall ("sb_epoll_create1" int) flags))
+
+  (defun epoll-ctl-add (epfd fd events)
+    (int-syscall ("sb_epoll_ctl_add" int int unsigned-int) epfd fd events))
+
+  (defun epoll-ctl-mod (epfd fd events)
+    (int-syscall ("sb_epoll_ctl_mod" int int unsigned-int) epfd fd events))
+
+  (defun epoll-ctl-del (epfd fd)
+    (int-syscall ("sb_epoll_ctl_del" int int) epfd fd))
+
+  (defun epoll-wait (epfd fds-sap maxevents timeout-ms)
+    "Wait for events on epfd. fds-sap is a SAP to int array receiving ready fds.
+Returns count of ready fds, or (values NIL errno) on error."
+    (int-syscall ("sb_epoll_wait" int (* t) int int)
+                 epfd fds-sap maxevents timeout-ms)))
+
+;;;; kqueue (BSD)
+#+bsd
+(progn
+  (define-alien-type nil
+    (struct kevent
+      (ident  unsigned-long)    ; uintptr_t  - 8 bytes
+      (filter short)            ; int16_t    - 2 bytes
+      (flags  unsigned-short)   ; uint16_t   - 2 bytes
+      (fflags unsigned-int)     ; uint32_t   - 4 bytes
+      (data   long)             ; intptr_t   - 8 bytes
+      (udata  unsigned-long)))  ; void*      - 8 bytes = 32 total
+
+  (declaim (inline kqueue))
+  (defun kqueue ()
+    (int-syscall ("kqueue")))
+
+  (defun kevent (kq changelist nchanges eventlist nevents timeout-sap)
+    "Call kevent(2). changelist/eventlist are SAPs to kevent arrays.
+timeout-sap is SAP to struct timespec, or (int-sap 0) for no timeout."
+    (int-syscall ("kevent" int (* t) int (* t) int (* t))
+                 kq changelist nchanges eventlist nevents timeout-sap)))
+
 ;;;; sys/select.h
 
 (defmacro with-fd-setsize ((n) &body body)
