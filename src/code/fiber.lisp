@@ -1166,3 +1166,425 @@ back to the scheduler."
   (set-fiber-run-trampoline
    (sb-kernel:get-lisp-obj-address #'fiber-trampoline)))
 
+;;;; ===== Scheduler =====
+
+(defun make-fiber-scheduler (&key idle-hook)
+  "Create a new fiber scheduler for the current thread."
+  (let ((sched (%make-fiber-scheduler
+                :carrier *current-thread*
+                :run-deque (%make-wsd)
+                :idle-hook idle-hook)))
+    ;; Try to create platform-optimal event multiplexer
+    #+(or linux bsd)
+    (let ((efd #+linux (sb-unix:epoll-create1 0)
+               #+bsd   (sb-unix:kqueue)))
+      (when efd  ; nil on error
+        (setf (fiber-scheduler-event-fd sched) efd
+              (fiber-scheduler-registered-fds sched) (make-hash-table))))
+    sched))
+
+(defun submit-fiber (target fiber)
+  "Submit a fiber for execution.
+TARGET can be a FIBER-SCHEDULER (pushes directly to its deque) or a
+FIBER-SCHEDULER-GROUP (atomically increments active-count, picks a random
+scheduler, and pushes to its deque)."
+  (etypecase target
+    (fiber-scheduler
+     ;; Direct deque push — only safe from the owner (carrier) thread,
+     ;; or during setup before any carrier has started.
+     (let ((carrier (fiber-scheduler-carrier target)))
+       (when (and carrier (not (eq carrier *current-thread*)))
+         (error "submit-fiber to ~S from non-owner thread (owner: ~S, caller: ~S)"
+                target carrier *current-thread*)))
+     (setf (fiber-scheduler fiber) target
+           (fiber-state fiber) :runnable)
+     (wsd-push (fiber-scheduler-run-deque target) fiber))
+    (fiber-scheduler-group
+     ;; Reject submissions after group shutdown has started
+     (when (fsg-closed-p target)
+       (error "Cannot submit fiber to closed group ~S" target))
+     ;; Atomically increment active-count so carriers don't exit prematurely
+     (loop for old = (fsg-active-count target)
+           until (eq (sb-ext:cas (fsg-active-count target) old (1+ old))
+                     old))
+     ;; Track fiber for result collection by finish-fibers
+     (sb-ext:atomic-push fiber (fsg-fibers target))
+     ;; Pick a random scheduler and push to its PENDING queue (not the
+     ;; deque directly).  The Chase-Lev deque only supports owner push;
+     ;; this call may come from a non-carrier thread (e.g., hunchentoot's
+     ;; accept thread), so we must use the thread-safe pending list.
+     ;; The carrier's scheduler loop drains pending-fibers into the deque.
+     (let* ((schedulers (fsg-schedulers target))
+            (sched (aref schedulers (random (length schedulers)))))
+       (setf (fiber-scheduler fiber) sched
+             (fiber-state fiber) :runnable)
+       (sb-ext:atomic-push fiber (fiber-scheduler-pending-fibers sched))
+       ;; Wake one parked carrier to pick up the new work
+       (sb-thread:condition-notify (fsg-park-cv target))))))
+
+(defun try-steal-fiber (scheduler)
+  "Try to steal a fiber from a sibling scheduler in the group.
+Returns the stolen fiber, or NIL."
+  (let ((group (fiber-scheduler-group scheduler)))
+    (when group
+      (let* ((schedulers (fsg-schedulers group))
+             (n (length schedulers))
+             (start (random n)))
+        (loop for i from 0 below n
+              for idx = (mod (+ start i) n)
+              for victim = (aref schedulers idx)
+              unless (eq victim scheduler)
+                  do (let ((stolen (wsd-steal (fiber-scheduler-run-deque victim))))
+                   (when stolen (return stolen))))))))
+
+#+linux
+(defun %scheduler-index-io-waiter (scheduler fiber)
+  "Index FIBER in SCHEDULER's epoll waiter table by its wait-fd."
+  (let* ((fd (fiber-wait-fd fiber))
+         (table (fiber-scheduler-io-waiters scheduler)))
+    (setf (gethash fd table) (cons fiber (gethash fd table))
+          (fiber-io-indexed-p fiber) t)
+    (incf (fiber-scheduler-io-waiter-count scheduler))))
+
+#+linux
+(defun %scheduler-remove-io-waiter (scheduler fiber)
+  "Remove FIBER from SCHEDULER's io-waiters table."
+  (let* ((fd (fiber-wait-fd fiber))
+         (table (fiber-scheduler-io-waiters scheduler))
+         (waiters (gethash fd table)))
+    (when waiters
+      (let ((remaining (delete fiber waiters :count 1)))
+        (if remaining
+            (setf (gethash fd table) remaining)
+            (remhash fd table)))
+      (setf (fiber-io-indexed-p fiber) nil)
+      (decf (fiber-scheduler-io-waiter-count scheduler)))))
+
+#+linux
+(defun %scheduler-wake-ready-io-waiters (scheduler deque)
+  "Wake epoll-indexed fibers whose FDs were reported ready this tick."
+  (let ((ready-fds (fiber-scheduler-ready-fds scheduler))
+        (table (fiber-scheduler-io-waiters scheduler)))
+    (maphash
+     (lambda (fd ignored)
+       (declare (ignore ignored))
+       (let ((waiters (gethash fd table)))
+         (when waiters
+           (remhash fd table)
+           (dolist (f waiters)
+             ;; Skip stale entries defensively (e.g. if state changed early).
+             (when (and (fiber-io-indexed-p f)
+                        (eq (fiber-state f) :suspended))
+               (when (>= (fiber-heap-index f) 0)
+                 (%heap-remove scheduler f))
+               (setf (fiber-io-indexed-p f) nil
+                     (fiber-next-waiting f) nil
+                     (fiber-state f) :runnable
+                     (fiber-wake-condition f) nil)
+               (decf (fiber-scheduler-io-waiter-count scheduler))
+               (wsd-push deque f))))))
+     ready-fds)))
+
+(declaim (inline scheduler-has-waiters-p))
+(defun scheduler-has-waiters-p (scheduler)
+  (or (fiber-scheduler-waiting scheduler)
+      (plusp (fiber-scheduler-deadline-heap-count scheduler))
+      #+linux (plusp (fiber-scheduler-io-waiter-count scheduler))))
+
+;;;; ===== Per-scheduler deadline min-heap =====
+;;;
+;;; Binary min-heap ordered by fiber-deadline.  Each fiber's heap-index
+;;; slot enables O(log N) removal.  Used to avoid O(W) generic list
+;;; scans for deadline checks.
+
+(declaim (inline %heap-parent %heap-left %heap-right))
+(defun %heap-parent (i) (ash (1- i) -1))
+(defun %heap-left (i) (1+ (ash i 1)))
+(defun %heap-right (i) (+ 2 (ash i 1)))
+
+(defun %heap-sift-up (heap i)
+  "Sift heap[i] upward until heap property is restored."
+  (let* ((fiber (svref heap i))
+         (dl (fiber-deadline fiber)))
+    (loop while (> i 0) do
+      (let* ((parent-idx (%heap-parent i))
+             (parent (svref heap parent-idx)))
+        (when (<= (fiber-deadline parent) dl) (return))
+        (setf (svref heap i) parent
+              (fiber-heap-index parent) i
+              i parent-idx)))
+    (setf (svref heap i) fiber
+          (fiber-heap-index fiber) i)))
+
+(defun %heap-sift-down (heap count i)
+  "Sift heap[i] downward until heap property is restored."
+  (let* ((fiber (svref heap i))
+         (dl (fiber-deadline fiber)))
+    (loop
+      (let ((left (%heap-left i))
+            (smallest i)
+            (smallest-dl dl))
+        (when (and (< left count)
+                   (< (fiber-deadline (svref heap left)) smallest-dl))
+          (setf smallest left
+                smallest-dl (fiber-deadline (svref heap left))))
+        (let ((right (%heap-right i)))
+          (when (and (< right count)
+                     (< (fiber-deadline (svref heap right)) smallest-dl))
+            (setf smallest right)))
+        (when (= smallest i) (return))
+        (let ((child (svref heap smallest)))
+          (setf (svref heap i) child
+                (fiber-heap-index child) i
+                i smallest))))
+    (setf (svref heap i) fiber
+          (fiber-heap-index fiber) i)))
+
+(defun %heap-insert (scheduler fiber)
+  "Insert FIBER into SCHEDULER's deadline heap."
+  (let* ((heap (fiber-scheduler-deadline-heap scheduler))
+         (n (fiber-scheduler-deadline-heap-count scheduler)))
+    (when (>= n (length heap))
+      (let ((new-heap (make-array (* 2 (length heap)))))
+        (replace new-heap heap)
+        (setf heap new-heap
+              (fiber-scheduler-deadline-heap scheduler) new-heap)))
+    (setf (svref heap n) fiber
+          (fiber-heap-index fiber) n)
+    (incf (fiber-scheduler-deadline-heap-count scheduler))
+    (%heap-sift-up heap n)))
+
+(defun %heap-remove (scheduler fiber)
+  "Remove FIBER from SCHEDULER's deadline heap by its heap-index."
+  (let ((i (fiber-heap-index fiber)))
+    (when (< i 0) (return-from %heap-remove))
+    (setf (fiber-heap-index fiber) -1)
+    (let* ((heap (fiber-scheduler-deadline-heap scheduler))
+           (n (decf (fiber-scheduler-deadline-heap-count scheduler))))
+      (when (= i n)
+        (setf (svref heap n) nil)
+        (return-from %heap-remove))
+      (let ((last (svref heap n)))
+        (setf (svref heap n) nil
+              (svref heap i) last
+              (fiber-heap-index last) i)
+        (if (and (> i 0)
+                 (< (fiber-deadline last)
+                    (fiber-deadline (svref heap (%heap-parent i)))))
+            (%heap-sift-up heap i)
+            (%heap-sift-down heap n i))))))
+
+(defun %heap-pop-expired (scheduler now deque)
+  "Pop all expired fibers from the deadline heap and push to run deque.
+Does NOT clear fiber-next-waiting -- the fiber may also be on the generic
+waiting list (deadline+predicate case), and the intrusive list walk needs
+the pointer intact to continue traversal."
+  (let ((heap (fiber-scheduler-deadline-heap scheduler)))
+    (loop while (plusp (fiber-scheduler-deadline-heap-count scheduler))
+          for fiber = (svref heap 0)
+          while (<= (fiber-deadline fiber) now)
+          do
+      (%heap-remove scheduler fiber)
+      #+linux
+      (when (fiber-io-indexed-p fiber)
+        (%scheduler-remove-io-waiter scheduler fiber))
+      (setf (fiber-state fiber) :runnable
+            (fiber-wake-condition fiber) nil)
+      (wsd-push deque fiber))))
+
+#+linux
+(defun %scheduler-harvest-epoll (scheduler timeout-ms)
+  "Run epoll_wait with TIMEOUT-MS, drain all pending events.
+With EPOLLET|EPOLLONESHOT each fd fires at most once, so drain terminates naturally."
+  (let ((efd (fiber-scheduler-event-fd scheduler))
+        (ready-fds (fiber-scheduler-ready-fds scheduler)))
+    (when (minusp efd) (return-from %scheduler-harvest-epoll 0))
+    (clrhash ready-fds)
+    (let ((buf (fiber-scheduler-epoll-buf scheduler))
+          (total 0))
+      (sb-sys:with-pinned-objects (buf)
+        (let ((sap (sb-sys:vector-sap buf)))
+          (loop for ms = timeout-ms then 0
+                do (let ((n (sb-unix:epoll-wait efd sap 64 ms)))
+                     (when (or (null n) (<= n 0)) (return))
+                     (dotimes (i n)
+                       (setf (gethash (aref buf i) ready-fds) t))
+                     (incf total n)
+                     (when (< n 64) (return))))))
+      total)))
+
+(defun run-fiber-scheduler (scheduler)
+  "Run the scheduler loop on the current thread. Returns when all
+fibers have completed."
+  (setf (fiber-scheduler-carrier scheduler) *current-thread*)
+  ;; Install the C trampoline if not done yet
+  (install-fiber-trampoline)
+  ;; Register persistent GC context for this carrier thread (one-time locks)
+  (init-carrier-fiber-context)
+  (let ((*current-scheduler* scheduler)
+        (*current-fiber* nil)
+        (deque (fiber-scheduler-run-deque scheduler))
+        (group (fiber-scheduler-group scheduler)))
+    (unwind-protect
+         (let ((maintenance-counter 0))
+           (declare (fixnum maintenance-counter))
+           (flet ((%scheduler-maintenance ()
+                    ;; Drain pending-fibers queue (submitted by external threads)
+                    ;; into the local deque.  Uses CAS to atomically grab the list.
+                    (let ((pending (loop for old = (fiber-scheduler-pending-fibers scheduler)
+                                        when (null old) return nil
+                                        when (eq (sb-ext:cas
+                                                  (fiber-scheduler-pending-fibers scheduler)
+                                                  old nil)
+                                                 old)
+                                        return old)))
+                      (dolist (f (nreverse pending))
+                        (wsd-push deque f)))
+                    ;; Check waiting fibers for wake conditions
+                    ;; Capture time once per tick to avoid redundant vDSO calls.
+                    (let ((now (get-internal-real-time))
+                          (still-head nil)
+                          (still-tail nil))
+                      #+linux
+                      (progn
+                        (%scheduler-harvest-epoll scheduler 0)
+                        (when (plusp (fiber-scheduler-io-waiter-count scheduler))
+                          (%scheduler-wake-ready-io-waiters scheduler deque)))
+                      ;; Pop expired deadline entries from heap
+                      (when (plusp (fiber-scheduler-deadline-heap-count scheduler))
+                        (%heap-pop-expired scheduler now deque))
+                      ;; Walk intrusive waiting list; capture next before modifying
+                      (loop for f = (fiber-scheduler-waiting scheduler) then next
+                            for next = (when f (fiber-next-waiting f))
+                            while f do
+                        (block check-fiber
+                          ;; Skip fibers already woken by io-waiter wake or heap expiry
+                          (unless (eq (fiber-state f) :suspended)
+                            (return-from check-fiber))
+                          (let ((wake nil))
+                            ;; Check deadline using captured 'now'
+                            (let ((dl (fiber-deadline f)))
+                              (when (and dl (>= now dl))
+                                (setf wake t)))
+                            ;; Non-I/O waiters, or non-Linux, or no epoll: call wake-condition
+                            (unless wake
+                              (when (and (fiber-wake-condition f)
+                                         (funcall (fiber-wake-condition f)))
+                                (setf wake t)))
+                            (if wake
+                                (progn
+                                  (when (>= (fiber-heap-index f) 0)
+                                    (%heap-remove scheduler f))
+                                  (setf (fiber-next-waiting f) nil
+                                        (fiber-state f) :runnable
+                                        (fiber-wake-condition f) nil)
+                                  (wsd-push deque f))
+                                (progn
+                                  ;; Link into still-waiting intrusive list
+                                  (setf (fiber-next-waiting f) nil)
+                                  (if still-tail
+                                      (setf (fiber-next-waiting still-tail) f)
+                                      (setf still-head f))
+                                  (setf still-tail f))))))
+                      (setf (fiber-scheduler-waiting scheduler) still-head))))
+             (labels ((%run-fiber (fiber)
+                        ;; Detect carrier migration (work stealing)
+                        (let ((migrated (not (eq (fiber-carrier fiber) *current-thread*))))
+                          ;; Update scheduler back-pointer and carrier
+                          (setf (fiber-scheduler fiber) scheduler
+                                (fiber-carrier fiber) *current-thread*)
+                          (setf (fiber-scheduler-current-fiber scheduler) fiber)
+                          (ecase (fiber-state fiber)
+                            (:created  (start-fiber scheduler fiber))
+                            (:runnable (resume-fiber scheduler fiber migrated))))
+                        ;; Fiber yielded or finished
+                        (setf (fiber-scheduler-current-fiber scheduler) nil)
+                        ;; Handle post-switch state
+                        (case (fiber-state fiber)
+                          (:suspended
+                           (let ((has-fd (>= (fiber-wait-fd fiber) 0))
+                                 (has-deadline (fiber-deadline fiber))
+                                 (has-wake (fiber-wake-condition fiber)))
+                             (cond
+                               ;; No wake reason → back to deque
+                               ((not (or has-wake has-fd has-deadline))
+                                (setf (fiber-state fiber) :runnable)
+                                (wsd-push deque fiber))
+                               ;; fd waiter on Linux with epoll → io-waiters (+ heap if deadline)
+                               #+linux
+                               ((and has-fd (not (minusp (fiber-scheduler-event-fd scheduler))))
+                                (%scheduler-index-io-waiter scheduler fiber)
+                                (when has-deadline
+                                  (%heap-insert scheduler fiber)))
+                               ;; Pure deadline, no predicate (fiber-sleep) → heap only
+                               ((and has-deadline (not has-wake))
+                                (%heap-insert scheduler fiber))
+                               ;; Deadline + something else → heap + generic list
+                               (has-deadline
+                                (%heap-insert scheduler fiber)
+                                (setf (fiber-next-waiting fiber)
+                                      (fiber-scheduler-waiting scheduler))
+                                (setf (fiber-scheduler-waiting scheduler) fiber))
+                               ;; Everything else → generic list
+                               (t
+                                (setf (fiber-next-waiting fiber)
+                                      (fiber-scheduler-waiting scheduler))
+                                (setf (fiber-scheduler-waiting scheduler) fiber)))))
+                          (:dead
+                           ;; Decrement group active count (CAS loop)
+                           (when group
+                             (loop for old = (fsg-active-count group)
+                                   until (eq (sb-ext:cas (fsg-active-count group)
+                                                         old (1- old))
+                                             old)))
+                           ;; Clean up dead fiber resources
+                           (destroy-fiber fiber)))))
+               (loop
+                 ;; Fast path: try local pop first, skip maintenance when
+                 ;; deque has runnable fibers (common case in tight loops).
+                 ;; Run maintenance every 64 iterations as backstop to avoid
+                 ;; starving I/O waiters and deadline timers.
+                 (let ((fiber (wsd-pop deque)))
+                   (cond
+                     (fiber
+                      (incf maintenance-counter)
+                      (when (>= maintenance-counter 64)
+                        (setf maintenance-counter 0)
+                        (%scheduler-maintenance))
+                      (%run-fiber fiber))
+                     (t
+                      ;; Deque empty: full maintenance, then try pop + steal
+                      (setf maintenance-counter 0)
+                      (%scheduler-maintenance)
+                      (let ((fiber2 (or (wsd-pop deque)
+                                        (try-steal-fiber scheduler))))
+                        (cond
+                          (fiber2
+                           (%run-fiber fiber2))
+                          ;; No runnable fibers but some waiting
+                          ((scheduler-has-waiters-p scheduler)
+                           (let ((hook (fiber-scheduler-idle-hook scheduler)))
+                             (if hook
+                                 (funcall hook scheduler)
+                                 (fiber-io-idle-hook scheduler))))
+                          ;; No local work and no waiting; check group
+                          (group
+                           (if (plusp (the fixnum (fsg-active-count group)))
+                               ;; Park until woken by submit-fiber or timeout
+                               (sb-thread:with-mutex ((fsg-park-lock group))
+                                 (sb-thread:condition-wait (fsg-park-cv group)
+                                                           (fsg-park-lock group)
+                                                           :timeout 0.001))  ; 1ms
+                               ;; All fibers globally done
+                               (return)))
+                          ;; Single-carrier mode: all done
+                          (t (return)))))))))))
+      ;; Cleanup: destroy persistent GC context (one-time locks)
+      (destroy-carrier-fiber-context)
+      ;; Cleanup: close event multiplexer fd
+      #+(or linux bsd)
+      (let ((efd (fiber-scheduler-event-fd scheduler)))
+        (when (not (minusp efd))
+          (sb-unix:unix-close efd)
+          (setf (fiber-scheduler-event-fd scheduler) -1))))))
+
