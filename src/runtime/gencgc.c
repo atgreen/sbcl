@@ -51,6 +51,7 @@
 #include "genesis/brothertree.h"
 #include "genesis/split-ordered-list.h"
 #include "var-io.h"
+#include "fiber.h"
 
 /* forward declarations */
 extern FILE *gc_activitylog();
@@ -3238,6 +3239,26 @@ conservative_stack_scan(struct thread* th,
     if (th == get_sb_vm_thread()) {
         if ((void*)cur_thread_approx_stackptr < esp) esp = cur_thread_approx_stackptr;
     }
+#ifdef LISP_FEATURE_SB_FIBER
+    /* If SP was not found in the carrier's control stack, check if this
+     * thread is running a fiber (SP would be in the fiber's stack). */
+    if ((!esp || esp == (void*)-1)) {
+        struct active_fiber_context* fiber_ctx = find_active_fiber_context(th);
+        if (fiber_ctx && fiber_ctx->fiber_stack_start) {
+            /* Re-scan interrupt contexts accepting fiber stack range */
+            for (i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th))-1; i>=0; i--) {
+                os_context_t *c = nth_interrupt_context(i, th);
+                if (c) {
+                    lispobj* esp1 = (lispobj*) *os_context_register_addr(c,reg_SP);
+                    if (esp1 >= fiber_ctx->fiber_stack_start
+                        && esp1 < fiber_ctx->fiber_stack_end
+                        && (void*)esp1 < esp)
+                        esp = esp1;
+                }
+            }
+        }
+    }
+#endif
 # else
     esp = cur_thread_approx_stackptr;
 # endif
@@ -3264,7 +3285,30 @@ conservative_stack_scan(struct thread* th,
 #endif
 
     lispobj* ptr;
-    for (ptr = esp; ptr < th->control_stack_end; ptr++) {
+#ifdef LISP_FEATURE_SB_FIBER
+    /* If a fiber is running on this thread, RSP is in the fiber's stack,
+     * not the carrier's control stack.  Scan the fiber's stack, then
+     * also scan the carrier's suspended stack (skipping guard pages). */
+    lispobj* scan_end = th->control_stack_end;
+    struct active_fiber_context* fctx = find_active_fiber_context(th);
+    if (fctx && fctx->fiber_stack_end
+        && !((lispobj*)esp >= th->control_stack_start && (lispobj*)esp < th->control_stack_end)) {
+        scan_end = fctx->fiber_stack_end;
+        /* Also scan the carrier's suspended control stack.
+         * Skip the 3 guard pages at the bottom (hard, soft, return). */
+        lispobj* carrier_start = (lispobj*)((char*)th->control_stack_start
+                                            + 3 * os_vm_page_size);
+        for (ptr = carrier_start; ptr < th->control_stack_end; ptr++) {
+            lispobj word = *ptr;
+            if (word >= BACKEND_PAGE_BYTES && potential_heap_pointer(word)) {
+                preserve_pointer(word, 0);
+            }
+        }
+    }
+#else
+    lispobj* scan_end = th->control_stack_end;
+#endif
+    for (ptr = esp; ptr < scan_end; ptr++) {
         lispobj word = *ptr;
         // Also note that we can eliminate small fixnums from consideration
         // since there is no memory on the 0th page.
@@ -3436,6 +3480,27 @@ garbage_collect_generation(generation_index_t generation, int raise,
             pin_call_chain_and_boxed_registers(th);
 #endif
         }
+
+#if !GENCGC_IS_PRECISE
+#ifdef LISP_FEATURE_SB_FIBER
+        /* Conservatively scan suspended fiber stacks.
+         * All mutator threads are stopped, so no lock is needed. */
+        {
+            struct fiber_gc_info* fi;
+            for (fi = all_fiber_gc_info; fi; fi = fi->next) {
+                lispobj* ptr;
+                lispobj exclude_from = (lispobj)fi->control_stack_base;
+                lispobj exclude_to = (lispobj)fi->control_stack_end;
+                for (ptr = fi->control_stack_pointer; ptr < fi->control_stack_end; ptr++) {
+                    lispobj word = *ptr;
+                    if (word >= BACKEND_PAGE_BYTES
+                        && !(exclude_from <= word && word < exclude_to))
+                        preserve_pointer(word, 0);
+                }
+            }
+        }
+#endif
+#endif
     }
 
 #ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
@@ -3553,9 +3618,27 @@ garbage_collect_generation(generation_index_t generation, int raise,
     {
         struct thread *th;
         for_each_thread(th) {
-            scav_binding_stack((lispobj*)th->binding_stack_start,
-                               (lispobj*)get_binding_stack_pointer(th),
-                               compacting_p() ? 0 : gc_mark_obj);
+            lispobj* bsp = (lispobj*)get_binding_stack_pointer(th);
+            lispobj* bs_start = (lispobj*)th->binding_stack_start;
+#ifdef LISP_FEATURE_SB_FIBER
+            /* If a fiber is running on this thread, BSP points into the
+             * fiber's binding stack.  Scan the fiber's binding stack
+             * (from fiber's bs_start to the current BSP).
+             * The carrier's binding stack is scanned via the gc_info list
+             * (registered by enter_fiber_gc_context). */
+            struct active_fiber_context* fctx = find_active_fiber_context(th);
+            if (fctx && fctx->fiber_binding_stack_start
+                && !(bsp >= bs_start
+                     && bsp <= (lispobj*)((char*)bs_start + BINDING_STACK_SIZE))) {
+                scav_binding_stack(fctx->fiber_binding_stack_start,
+                                   bsp,
+                                   compacting_p() ? 0 : gc_mark_obj);
+            } else
+#endif
+            {
+                scav_binding_stack(bs_start, bsp,
+                                   compacting_p() ? 0 : gc_mark_obj);
+            }
             /* do the tls as well */
             lispobj* from = &th->lisp_thread;
             lispobj* to = (lispobj*)(SymbolValue(FREE_TLS_INDEX,0) + (char*)th);
@@ -3565,6 +3648,17 @@ garbage_collect_generation(generation_index_t generation, int raise,
             else
                 gc_mark_range(from, nwords);
         }
+#ifdef LISP_FEATURE_SB_FIBER
+        /* Scavenge suspended fiber binding stacks */
+        {
+            struct fiber_gc_info* fi;
+            for (fi = all_fiber_gc_info; fi; fi = fi->next) {
+                scav_binding_stack(fi->binding_stack_start,
+                                   fi->binding_stack_pointer,
+                                   compacting_p() ? 0 : gc_mark_obj);
+            }
+        }
+#endif
     }
 
     if (!compacting_p()) {
