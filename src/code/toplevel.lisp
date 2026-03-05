@@ -246,7 +246,7 @@ any non-negative real number."
            :datum seconds
            :expected-type '(real 0)))
   #+sb-fiber
-  (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
+  (when sb-thread::*current-fiber*
     (let ((result (funcall 'sb-thread::%fiber-sleep seconds)))
       (unless (eq result :pinned-fall-through)
         (return-from sleep nil))))

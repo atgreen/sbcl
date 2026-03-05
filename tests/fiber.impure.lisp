@@ -31,8 +31,28 @@
          (sched (make-fiber-scheduler)))
     (submit-fiber sched fiber)
     (run-fiber-scheduler sched)
-    (assert (eql (fiber-result fiber) 6))
+    (assert (equal (fiber-result fiber) '(6)))
     (assert (eq (fiber-state fiber) :dead))))
+
+;;; Fiber returning multiple values
+(with-test (:name (:fiber :multiple-return-values) :skipped-on :win32)
+  (let* ((fiber (make-fiber (lambda () (values 1 2 3))
+                            :name "multi-value-fiber"))
+         (sched (make-fiber-scheduler)))
+    (submit-fiber sched fiber)
+    (run-fiber-scheduler sched)
+    (assert (equal (fiber-result fiber) '(1 2 3)))
+    ;; fiber-join returns all values
+    (let* ((f2 (make-fiber (lambda () (values :a :b)) :name "join-multi"))
+           (result nil)
+           (sched2 (make-fiber-scheduler)))
+      (submit-fiber sched2 f2)
+      (submit-fiber sched2
+                    (make-fiber (lambda ()
+                                  (setf result (multiple-value-list (fiber-join f2))))
+                                :name "joiner"))
+      (run-fiber-scheduler sched2)
+      (assert (equal result '(:a :b))))))
 
 ;;; Multiple fibers running sequentially
 (with-test (:name (:fiber :multiple-fibers) :skipped-on :win32)

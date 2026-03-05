@@ -221,7 +221,7 @@ If SERVE-EVENTS is true (the default), events on other FDs are served while
 waiting."
   ;; Fiber dispatch: if inside a fiber, yield instead of blocking carrier
   #+sb-fiber
-  (when (and sb-thread::*current-fiber* sb-thread::*current-scheduler*)
+  (when sb-thread::*current-fiber*
     (let ((result (funcall 'sb-thread::%fiber-wait-until-fd-usable
                            fd direction timeout)))
       (unless (eq result :pinned-fall-through)

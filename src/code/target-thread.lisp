@@ -637,7 +637,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
                         (try) (try) (try)
                         (max 1 (truncate (- (get-tick) start) 3)))))
       #+sb-fiber
-      (when (and *current-fiber* *current-scheduler*)
+      (when *current-fiber*
         (let ((result (funcall '%fiber-wait-for test stop-sec stop-usec)))
           (unless (eq result :pinned-fall-through)
             (return-from %%wait-for result))))
@@ -975,7 +975,7 @@ Notes:
       #+sb-thread
       (when waitp
         #+sb-fiber
-        (when (and *current-fiber* *current-scheduler*)
+        (when *current-fiber*
           (let ((result (funcall '%fiber-grab-mutex mutex timeout)))
             (unless (eq result :pinned-fall-through)
               (return-from grab-mutex result))))
@@ -988,7 +988,7 @@ Notes:
   ;; This _does_ support *DEADLINE* hence the DECODE-TIMEOUT call.
   (or (%try-mutex mutex)
       #+sb-fiber
-      (when (and *current-fiber* *current-scheduler*)
+      (when *current-fiber*
         (let ((result (funcall '%fiber-grab-mutex mutex nil)))
           (unless (eq result :pinned-fall-through)
             (return-from grab-mutex-no-check-deadlock result))))
@@ -1109,7 +1109,7 @@ IF-NOT-OWNER is :FORCE)."
   ;; %fiber-condition-wait handles pin check internally; returns
   ;; :pinned-fall-through when the fiber is pinned and should block normally.
   #+(and sb-thread sb-fiber)
-  (when (and *current-fiber* *current-scheduler*)
+  (when *current-fiber*
     (let ((vals (multiple-value-list
                  (funcall '%fiber-condition-wait queue mutex timeout stop-sec stop-usec))))
       (unless (eq (first vals) :pinned-fall-through)

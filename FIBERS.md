@@ -292,9 +292,10 @@ it up.
 ```
 
 **`function`** --- a function of no arguments.  This is the fiber's
-entry point.  When it returns normally, the return value becomes the
-fiber's result (retrievable via `fiber-result`).  If it signals an
-unhandled error, the condition object becomes the result instead.
+entry point.  When it returns normally, all return values are captured
+as a list in the fiber's result slot (retrievable via `fiber-result`,
+or as multiple values via `fiber-join`).  If it signals an unhandled
+error, the condition object becomes the result instead.
 
 **`name`** --- an optional string for debugging.  Appears in
 `print-object` output and backtrace annotations.
@@ -415,23 +416,26 @@ condition becomes true.
 (fiber-join target &key timeout)
 ```
 
-Waits until the fiber `target` completes and returns two values:
-
-1. The **result** --- the return value of the fiber's function, or the
-   condition object if it signaled an error.
-2. A boolean **errorp** --- `T` if the fiber terminated due to an
-   unhandled error, `NIL` for a normal return.
+Waits until the fiber `target` completes and returns the fiber
+function's return values (via `values-list`), analogous to
+`join-thread`.  If the fiber terminated due to an unhandled error, the
+single return value is the condition object; use `fiber-error-p` to
+distinguish this from a normal return.
 
 Returns `nil` (single value) if the timeout expires first.
 A fiber cannot join itself.
 
-The two-value protocol is analogous to `ignore-errors`, so callers can
-distinguish a fiber that intentionally returned a condition object from
-one that signaled an error:
-
 ```lisp
-(multiple-value-bind (result errorp) (fiber-join child)
-  (if errorp
+;; Single return value:
+(fiber-join child)  => result
+
+;; Multiple return values:
+(multiple-value-bind (x y) (fiber-join child)
+  (format t "Got ~S and ~S~%" x y))
+
+;; Error checking:
+(let ((result (fiber-join child)))
+  (if (fiber-error-p child)
       (format t "Fiber failed: ~A~%" result)
       (format t "Fiber returned: ~S~%" result)))
 ```
@@ -468,8 +472,10 @@ result.
 
 When `submit-fiber` targets a scheduler group, the fiber is pushed
 onto a randomly chosen carrier's pending queue (a thread-safe atomic
-list) and a parked carrier is woken.  This is safe to call from any
-thread, including non-carrier threads and fibers on other carriers.
+list) and a parked carrier is woken if one exists.  If all carriers
+are busy, the fiber remains in the pending queue until the next
+maintenance pass drains it.  This is safe to call from any thread,
+including non-carrier threads and fibers on other carriers.
 
 ### 2.7 Multi-Carrier Scheduling
 
@@ -519,15 +525,16 @@ handle immediately.  All carriers run on background threads.
 
 Submits a new fiber to the group.  Atomically increments the group's
 active count (so carriers know not to exit), pushes the fiber onto a
-randomly chosen carrier's pending queue, and wakes a parked carrier.
-This is safe to call from any thread.
+randomly chosen carrier's pending queue, and wakes a parked carrier
+if one exists.  This is safe to call from any thread.
 
 ```lisp
 (finish-fibers group)  => list-of-results
 (fiber-group-done-p group) => boolean
 ```
 
-`finish-fibers` joins all carrier threads and returns results.
+`finish-fibers` blocks until all fibers in the group have completed,
+then returns their results.
 `fiber-group-done-p` is a non-blocking check that returns `t` when
 the group's active count reaches zero.
 
@@ -670,12 +677,13 @@ or deadline), or `:dead` (function returned or signaled).
 
 ```lisp
 (fiber-name fiber)     => string-or-nil
-(fiber-result fiber)   => value
+(fiber-result fiber)   => list
 (fiber-alive-p fiber)  => boolean
 ```
 
-`fiber-result` returns the fiber's result value (or condition object)
-after death.  `fiber-alive-p` is shorthand for
+`fiber-result` returns the fiber's result values as a list (or a
+single-element list containing the condition object on error) after
+death.  Use `fiber-join` to receive the values via `values-list`.  `fiber-alive-p` is shorthand for
 `(not (eq (fiber-state fiber) :dead))`.
 
 ```lisp
@@ -725,7 +733,7 @@ starved.
 | `submit-fiber` | Submit a fiber to a scheduler or group |
 | `run-fibers` | Create group, run fibers, return results (blocking) |
 | `start-fibers` | Create group and start carriers (non-blocking) |
-| `finish-fibers` | Join carriers and return results |
+| `finish-fibers` | Block until all fibers complete, return results |
 | `fiber-group-done-p` | Non-blocking completion check |
 | `fiber-yield` | Suspend current fiber |
 | `fiber-sleep` | Suspend for a duration |
@@ -737,7 +745,7 @@ starved.
 | `current-fiber` | Return current fiber or nil |
 | `fiber-state` | Return fiber's lifecycle state |
 | `fiber-name` | Return fiber's name |
-| `fiber-result` | Return fiber's result value |
+| `fiber-result` | Return fiber's result values (as list) |
 | `fiber-error-p` | Check if fiber terminated with an error |
 | `fiber-alive-p` | Check if fiber is not dead |
 | `list-all-fibers` | Snapshot of all live fibers |
@@ -1580,6 +1588,16 @@ performs a full maintenance cycle:
    returns true, it is moved to the deque.  Fibers that remain
    waiting are re-linked into a new list.
 
+Note that fiber-aware mutex acquisition (Section 2.8.1) and condition
+variable waits (Section 2.8.2) currently use predicate-based parking,
+which places the waiting fiber on the generic waiting list.  This
+means mutex and condition variable waiters are checked via the O(W)
+waiting list walk rather than a targeted wakeup mechanism.  This is
+adequate when mutex contention among fibers is low (the typical case
+for I/O-heavy server workloads), but a per-mutex fiber wait queue
+with explicit wakeup from `release-mutex` would provide O(1) wakeup
+and is a planned improvement.
+
 ### 8.4 Post-Switch Dispatch (Suspended, Dead)
 
 After `fiber_switch` returns (the fiber yielded or died), the
@@ -1940,33 +1958,48 @@ fiber_switch → fiber_entry_trampoline (asm)
 ```lisp
 (unwind-protect
      (handler-case
-         (setf (fiber-result fiber) (funcall (fiber-function fiber)))
-       (error (c)
-         (setf (fiber-result fiber) c)))
+         (setf (fiber-result fiber)
+               (multiple-value-list (funcall (fiber-function fiber))))
+       (sb-sys:interactive-interrupt (c)
+         (error c))  ; propagate Ctrl-C to carrier
+       (serious-condition (c)
+         (setf (fiber-result fiber) (list c))))
   ;; cleanup forms ...
   )
 ```
 
-If the user function returns normally, its return value is stored as
-the fiber's result.  If it signals an unhandled error, the condition
-object becomes the result.  Either way, execution reaches the
-`unwind-protect` cleanup.
+If the user function returns normally, all of its return values are
+captured as a list in the fiber's result slot (matching the
+`thread-result` convention).  If it signals an unhandled error, the
+condition object is stored as a single-element list.  Either way,
+execution reaches the `unwind-protect` cleanup.
 
 ### 12.2 Error Handling and Result Capture
 
 The `handler-case` around the user function catches all conditions of
-type `error`.  This prevents an unhandled error in a fiber from
-killing the carrier thread (which would take down the scheduler and
-all other fibers on that carrier).
+type `serious-condition` (which includes `error`, `storage-condition`,
+and `sb-ext:timeout`).  This prevents an unhandled condition in a
+fiber from killing the carrier thread (which would take down the
+scheduler and all other fibers on that carrier).
 
-The captured condition or return value is stored in `fiber-result`
-and can be retrieved by `fiber-join` or directly after the fiber is
-dead.  When an error is caught, the fiber's `errorp` flag is set to
-`T`.  The predicate `fiber-error-p` returns this flag, and
-`fiber-join` returns it as a second value (analogous to
-`ignore-errors`), so callers can distinguish a fiber that
-intentionally returned a condition object from one that signaled an
-error.
+The one exception is `sb-sys:interactive-interrupt` (Ctrl-C / SIGINT),
+which is re-signaled so it propagates to the carrier thread.  This
+preserves the user's ability to break into the debugger interactively.
+
+Because the `handler-case` catches conditions without invoking the
+debugger, errors in fibers are silently captured rather than
+triggering an interactive break.  If interactive debugging is desired,
+the user should establish a `handler-bind` with `invoke-debugger`
+inside the fiber's function.  Restarts like `abort` work within the
+fiber's own catch/block scope.
+
+The captured condition or return values are stored in `fiber-result`
+as a list and can be retrieved by `fiber-join` (which returns them via
+`values-list`, analogous to `join-thread`) or directly after the fiber
+is dead.  When an error is caught, the fiber's `errorp` flag is set to
+`T`.  The predicate `fiber-error-p` returns this flag, so callers can
+distinguish a fiber that intentionally returned a condition object
+from one that signaled an error.
 
 Non-local exits via `throw`, `return-from`, or `go` that target
 tags or blocks within the fiber's own function work normally --- the
@@ -2053,12 +2086,15 @@ disturbing the GC's use of `control-stack-start`/`control-stack-end`.
 ### 13.2 `serve-event` Dispatch (Fiber-Aware `wait-until-fd-usable`)
 
 `sb-sys:wait-until-fd-usable` is defined in `serve-event.lisp`.  When
-fibers are enabled, it checks for fiber context at the top of the
-function:
+fibers are enabled, it checks `*current-fiber*` at the top of the
+function.  A single special variable check suffices because
+`*current-fiber*` is only non-nil inside the scheduler loop where
+`*current-scheduler*` is already bound --- the invariant
+`*current-fiber*` → `*current-scheduler*` holds by construction:
 
 ```lisp
 #+sb-fiber
-(when (and *current-fiber* *current-scheduler*)
+(when *current-fiber*
   (let ((result (%fiber-wait-until-fd-usable fd direction timeout)))
     (unless (eq result :pinned-fall-through)
       (return-from wait-until-fd-usable result))))
@@ -2083,7 +2119,7 @@ futex-based wait path:
 
 ```lisp
 #+sb-fiber
-(when (and *current-fiber* *current-scheduler*)
+(when *current-fiber*
   (let ((result (%fiber-grab-mutex mutex timeout)))
     (unless (eq result :pinned-fall-through)
       (return-from grab-mutex result))))

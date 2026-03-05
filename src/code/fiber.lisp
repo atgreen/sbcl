@@ -1077,10 +1077,13 @@ back to the scheduler."
          (handler-case
              (let ((fn (fiber-function fiber)))
                (when fn
-                 (setf (fiber-result fiber) (funcall fn)))
+                 (setf (fiber-result fiber) (multiple-value-list (funcall fn))))
                (setf completed-normally t))
-           (error (c)
-             (setf (fiber-result fiber) c
+           (sb-sys:interactive-interrupt (c)
+             ;; Let Ctrl-C propagate to the carrier thread
+             (error c))
+           (serious-condition (c)
+             (setf (fiber-result fiber) (list c)
                    (fiber-errorp fiber) t
                    completed-normally t)))
       ;; Detect cross-boundary non-local exit.  If neither the normal
@@ -1091,11 +1094,11 @@ back to the scheduler."
       ;; report it instead of silently returning NIL.
       (unless completed-normally
         (setf (fiber-result fiber)
-              (make-condition 'simple-error
-                              :format-control
-                              "Non-local exit (RETURN-FROM or GO) ~
-                               crossed fiber boundary in fiber ~S"
-                              :format-arguments (list (fiber-name fiber)))
+              (list (make-condition 'simple-error
+                                    :format-control
+                                    "Non-local exit (RETURN-FROM or GO) ~
+                                     crossed fiber boundary in fiber ~S"
+                                    :format-arguments (list (fiber-name fiber))))
               (fiber-errorp fiber) t))
       ;; Cleanup: mark dead, restore carrier TLS and BSP, switch back.
       ;; IMPORTANT: Re-read the scheduler from the fiber struct, NOT from
@@ -1690,9 +1693,11 @@ scheduler loop, avoiding a wrapper closure allocation."
 ;;;; ===== fiber-join =====
 
 (defun fiber-join (target &key timeout)
-  "Wait until TARGET fiber completes and return its result, or NIL on timeout.
-Returns two values: the result (or condition) and a boolean ERRORP that is T
-when the fiber terminated due to an unhandled error.
+  "Wait until TARGET fiber completes and return its result values, or NIL
+on timeout.  Returns the fiber function's return values (via VALUES-LIST),
+analogous to JOIN-THREAD.  If the fiber terminated due to an unhandled
+error, the single return value is the condition object; use FIBER-ERROR-P
+to distinguish this from a normal return.
 Works from both fiber context (parks the fiber) and OS thread context
 (blocks the thread via a waitqueue)."
   (when (eq target (current-fiber))
@@ -1700,12 +1705,12 @@ Works from both fiber context (parks the fiber) and OS thread context
   (cond
     ;; Already dead — just return result
     ((eq (fiber-state target) :dead)
-     (values (fiber-result target) (fiber-errorp target)))
+     (values-list (fiber-result target)))
     ;; In fiber context — park until target dies
-    ((and *current-fiber* *current-scheduler*)
+    (*current-fiber*
      (fiber-park (lambda () (eq (fiber-state target) :dead)) :timeout timeout)
      (if (eq (fiber-state target) :dead)
-         (values (fiber-result target) (fiber-errorp target))
+         (values-list (fiber-result target))
          nil))
     ;; OS thread context — spin-wait with brief sleeps
     (t
@@ -1714,7 +1719,7 @@ Works from both fiber context (parks the fiber) and OS thread context
                           (truncate (* timeout internal-time-units-per-second))))))
        (loop
          (when (eq (fiber-state target) :dead)
-           (return (values (fiber-result target) (fiber-errorp target))))
+           (return (values-list (fiber-result target))))
          (when (and deadline (>= (get-internal-real-time) deadline))
            (return nil))
          (sb-unix:nanosleep 0 1000000))))))
@@ -2073,7 +2078,7 @@ Blocks until all fibers have completed."
   (setf (fsg-closed-p group) t)
   (dolist (th (fsg-threads group))
     (join-thread th))
-  (mapcar #'fiber-result (fsg-fibers group)))
+  (mapcar (lambda (f) (car (fiber-result f))) (fsg-fibers group)))
 
 (defun fiber-group-done-p (group)
   "Return T if all fibers in GROUP have completed (non-blocking check)."
