@@ -1475,7 +1475,7 @@ process).
 
 ### 7.7 GC Safety Windows (`without-interrupts` vs. `without-gcing`)
 
-Two SBCL mechanisms control GC timing:
+Three SBCL mechanisms control GC timing:
 
 - **`without-interrupts`** --- defers delivery of asynchronous
   signals (including the stop-for-GC signal) but does not prevent
@@ -1483,6 +1483,14 @@ Two SBCL mechanisms control GC timing:
 
 - **`without-gcing`** --- prevents GC entirely (sets a flag that
   causes allocation to block until the region exits).
+
+- **`pseudo-atomic`** --- a compiler-emitted mechanism that wraps
+  short instruction sequences (primarily allocation) to defer GC
+  interrupts until the sequence completes.  The fiber save/restore
+  paths do not use `pseudo-atomic` directly, but it is part of the
+  GC safety picture: any allocation within a fiber (e.g., consing
+  a closure or growing an array) is already protected by
+  `pseudo-atomic` at the machine code level.
 
 The yield and resume paths use `without-interrupts` for most of their
 work.  This prevents the stop-for-GC signal from arriving mid-update,
