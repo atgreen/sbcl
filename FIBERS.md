@@ -1245,7 +1245,7 @@ Beyond the binding stack, SBCL maintains per-thread pointers to the
 current catch block (`*current-catch-block*`) and the current
 unwind-protect block (`*current-unwind-protect-block*`).  These are
 singly-linked lists threaded through the control stack, used by
-`throw`, `handler-case`, and `unwind-protect`.
+`throw` and `unwind-protect`.
 
 On yield, the fiber saves these pointers from the thread struct into
 `fiber-saved-catch-block` and `fiber-saved-unwind-protect-block`, then
