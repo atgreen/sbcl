@@ -756,6 +756,7 @@ starved.
 | `print-fiber-backtrace` | Symbolic backtrace for suspended fiber |
 | `*current-fiber*` | Dynamic variable: current fiber |
 | `*current-scheduler*` | Dynamic variable: current scheduler |
+| `fiber-scheduler-group` | Return the group a scheduler belongs to |
 | `*pinned-blocking-action*` | Policy for pinned blocking (`:warn`, `:error`, `nil`) |
 
 ## 3. Architecture Overview
