@@ -1018,8 +1018,9 @@ move the fiber struct (invalidating the address just computed) and
 require stopping the world at an inconvenient point.  By keeping
 everything as raw words, the switch path creates zero GC pressure.
 
-The TLS scratch hash table and overlay arrays are pre-allocated in the
-scheduler and fiber structs, not on the switch path.  The wake
+The TLS scratch hash table and overlay arrays (see Section 6.2) are
+pre-allocated in the scheduler and fiber structs, not on the switch
+path.  The wake
 condition closures are allocated by the caller before yielding.
 
 ### 4.6 Thread Register Patching on Carrier Migration
