@@ -1013,10 +1013,9 @@ fiber struct's tagged pointer using arithmetic (adding the slot offset
 and subtracting the lowtag), producing unsigned integers that never
 become heap-allocated SAPs.
 
-This matters because SAP allocation can trigger GC, which would
-move the fiber struct (invalidating the address just computed) and
-require stopping the world at an inconvenient point.  By keeping
-everything as raw words, the switch path creates zero GC pressure.
+A VOP with SAP arguments and suitable inline SAP constructors could
+also avoid allocation, but the raw word approach is simpler and makes
+the zero-allocation property obvious by construction.
 
 The TLS scratch hash table and overlay arrays (see Section 6.2) are
 pre-allocated in the scheduler and fiber structs, not on the switch
