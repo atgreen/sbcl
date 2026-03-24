@@ -1180,7 +1180,7 @@ the binding stack and writes the new value into the thread's TLS
 array.  When the binding is unwound, `unbind_to_here` pops entries,
 restoring old values and zeroing the binding stack entries.
 
-This create a problem for fibers.  When a fiber yields, it must save
+This creates a problem for fibers.  When a fiber yields, it must save
 its TLS state and restore the carrier thread's TLS state.  But the
 binding stack entries are the mechanism for tracking what needs to be
 restored --- and `unbind_to_here` destroys them.  If we unwound the
