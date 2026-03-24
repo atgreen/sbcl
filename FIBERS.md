@@ -1162,7 +1162,8 @@ Both sizes are configurable per-fiber via `make-fiber` keywords.
 Dynamic stack growth (as seen in Erlang/BEAM processes) is not
 supported.  Fiber stacks are fixed-size `mmap` allocations; growing
 them would require either relocating the stack (invalidating all
-interior pointers, return addresses, and GC-conservative references)
+interior pointers such as frame pointers and saved stack pointers,
+and GC-conservative references)
 or using discontiguous segments (requiring compiler support for
 segment-crossing checks on every function call).  Neither approach
 is feasible within SBCL's native-code compilation model.  The
