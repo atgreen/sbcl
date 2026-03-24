@@ -317,8 +317,7 @@ a diagnostic message, just like control stack overflow.
 
 **`initial-bindings`** --- an alist of `(symbol . value)` pairs.
 These are established as dynamic bindings (via `progv`) before the
-fiber's function is called, analogous to the `:initial-bindings`
-argument to `sb-thread:make-thread`.  The values in the alist are
+fiber's function is called.  The values in the alist are
 used directly (not evaluated); the caller is responsible for computing
 them before passing the alist.  This is the primary mechanism for
 giving each fiber its own copy of a special variable:
