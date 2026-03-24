@@ -194,14 +194,15 @@ bindings made within a fiber are local to that fiber,
 
 The implementation is guided by several priorities, roughly in order:
 
-**Correctness under GC.**  SBCL uses a generational, compacting,
+**Correctness under GC.** SBCL uses a generational, compacting,
 stop-the-world garbage collector.  The GC must be able to find every
 live Lisp object, including those on suspended fiber stacks and in
-fiber binding stacks.  Getting this wrong means silent heap corruption.
-Every design decision in the fiber runtime is constrained by the
-requirement that GC can fire at almost any point (the only exclusion is
-`without-gcing` regions) and must see a consistent view of all fiber
-state.
+fiber binding stacks.  Getting this wrong means silent heap
+corruption.  Every design decision in the fiber runtime is constrained
+by the requirement that GC can fire at almost any point (the only
+exclusion is `without-gcing` regions) and must see every fiber as
+either fully live on its carrier or fully suspended, never
+mid-transition.
 
 **Transparent integration.**  Existing SBCL code should work inside
 fibers without modification.  `grab-mutex`, `condition-wait`,
