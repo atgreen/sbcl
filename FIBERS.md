@@ -389,7 +389,11 @@ combines a wake predicate with an optional timeout:
 
 - **`predicate`** --- a function of no arguments.  The scheduler
   calls it during maintenance passes; when it returns true, the fiber
-  is woken.
+  is woken.  Note that the predicate is called in the dynamic
+  environment of the scheduler (a carrier thread), not in the
+  fiber's dynamic environment at the point of the `fiber-park` call.
+  It has indefinite extent and must capture any special variable
+  bindings it needs via its closure.
 
 - **`timeout`** --- seconds (may be fractional) after which the fiber
   is woken regardless of the predicate.
